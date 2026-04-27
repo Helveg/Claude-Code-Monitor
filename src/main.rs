@@ -1,7 +1,9 @@
 #![windows_subsystem = "windows"]
 
+mod action_window;
 mod diagnose;
 mod highlight;
+mod terminal;
 mod localization;
 mod models;
 mod native_interop;
@@ -12,6 +14,14 @@ mod updater;
 mod window;
 
 fn main() {
+    // Hint to TUI apps spawned in our embedded terminal that they're talking
+    // to a real ANSI-capable terminal. Without TERM set, libraries like Ink
+    // (used by claude code) fall back to a degraded mode where they render
+    // the cursor themselves as a reverse-video cell — which leaks visible
+    // "ghost cursor" blocks when the app moves on without cleaning up.
+    std::env::set_var("TERM", "xterm-256color");
+    std::env::set_var("COLORTERM", "truecolor");
+
     let args: Vec<String> = std::env::args().collect();
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     let debug_render_enabled = args.iter().any(|arg| arg == "--debug-render");

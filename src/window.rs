@@ -16,6 +16,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::action_window;
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::UsageData;
@@ -83,6 +84,8 @@ struct AppState {
     segment_w_design: i32,
 
     widget_visible: bool,
+
+    trigger_hwnd: Option<SendHwnd>,
 }
 
 #[derive(Clone, Debug)]
@@ -277,11 +280,11 @@ fn tray_icon_data_from_state() -> (Option<f64>, String) {
 }
 
 fn toggle_widget_visibility(hwnd: HWND) {
-    let new_visible = {
+    let (new_visible, trigger_hwnd) = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
             s.widget_visible = !s.widget_visible;
-            s.widget_visible
+            (s.widget_visible, s.trigger_hwnd.map(|h| h.to_hwnd()))
         } else {
             return;
         }
@@ -294,6 +297,9 @@ fn toggle_widget_visibility(hwnd: HWND) {
             render_layered();
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
+            if let Some(t) = trigger_hwnd {
+                let _ = ShowWindow(t, SW_HIDE);
+            }
         }
     }
 }
@@ -770,6 +776,13 @@ fn total_widget_width(segment_w_design: i32) -> i32 {
         + sc(RIGHT_MARGIN)
 }
 
+/// Combined footprint of the widget plus the trigger button (and its gap),
+/// in physical pixels at the current DPI. The button sits to the left of the
+/// widget so the region available for the bar segments shrinks accordingly.
+fn total_footprint_width(segment_w_design: i32) -> i32 {
+    total_widget_width(segment_w_design) + sc(action_window::TRIGGER_GAP) + sc(action_window::TRIGGER_SIZE)
+}
+
 pub fn run() {
     // Enable Per-Monitor DPI Awareness V2 for crisp rendering at any scale factor
     unsafe {
@@ -822,6 +835,7 @@ pub fn run() {
         }
 
         crate::highlight::register_overlay_class(HINSTANCE(hinstance.0));
+        action_window::register_classes(HINSTANCE(hinstance.0));
 
         let settings = load_settings();
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
@@ -908,6 +922,7 @@ pub fn run() {
                     .segment_w_design
                     .clamp(MIN_SEGMENT_W, MAX_SEGMENT_W),
                 widget_visible: settings.widget_visible,
+                trigger_hwnd: None,
             });
         }
 
@@ -944,6 +959,12 @@ pub fn run() {
             // Pre-warm the UIA occupant cache so the first drag has data.
             if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
                 crate::highlight::spawn_uia_scan(taskbar_hwnd, taskbar_rect);
+            }
+
+            // Trigger button: orange rounded square embedded next to the widget.
+            if let Some(trigger_hwnd) = action_window::create_trigger(HINSTANCE(hinstance.0)) {
+                native_interop::embed_in_taskbar(trigger_hwnd, taskbar_hwnd);
+                s.trigger_hwnd = Some(SendHwnd::from_hwnd(trigger_hwnd));
             }
 
             // Win11 pinned-app changes happen entirely in XAML and don't fire
@@ -1524,14 +1545,19 @@ fn offset_for_region(
     region: &crate::highlight::HighlightRegion,
     widget_width: i32,
 ) -> i32 {
+    let trigger_extent = sc(action_window::TRIGGER_SIZE) + sc(action_window::TRIGGER_GAP);
     let taskbar_center = (taskbar_rect.left + taskbar_rect.right) / 2;
     let region_center = (region.rect.left + region.rect.right) / 2;
-    let widget_right = if region_center < taskbar_center {
-        region.rect.left + widget_width
+    // The trigger button sits to the right of the widget, so the rightmost
+    // edge of the footprint is the trigger's right edge. tray_offset is the
+    // distance from that edge back to tray_left.
+    let footprint_right = if region_center < taskbar_center {
+        // Left-align: widget snugs against region.left, trigger follows on its right.
+        region.rect.left + widget_width + trigger_extent
     } else {
         region.rect.right
     };
-    (tray_left - widget_right).max(0)
+    (tray_left - footprint_right).max(0)
 }
 
 fn snap_widget_to_region(taskbar_hwnd: HWND, region: &crate::highlight::HighlightRegion) {
@@ -1546,8 +1572,9 @@ fn snap_widget_to_region(taskbar_hwnd: HWND, region: &crate::highlight::Highligh
 
     let dpi = CURRENT_DPI.load(Ordering::Relaxed).max(1) as i32;
     let region_w_design = region_w_physical * 96 / dpi;
+    let usable_design = region_w_design - action_window::TRIGGER_SIZE - action_window::TRIGGER_GAP;
     let bars_design =
-        region_w_design - FIXED_NON_BAR_DESIGN_WIDTH - (SEGMENT_COUNT - 1) * SEGMENT_GAP;
+        usable_design - FIXED_NON_BAR_DESIGN_WIDTH - (SEGMENT_COUNT - 1) * SEGMENT_GAP;
     let new_segment_w = (bars_design / SEGMENT_COUNT).clamp(MIN_SEGMENT_W, MAX_SEGMENT_W);
     let new_widget_w_physical = total_widget_width(new_segment_w);
 
@@ -1620,7 +1647,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd, segment_w_design) = {
+    let (hwnd, embedded, tray_offset, taskbar_hwnd, segment_w_design, trigger_hwnd, widget_visible) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -1646,6 +1673,8 @@ fn position_at_taskbar() {
             s.tray_offset,
             taskbar_hwnd,
             s.segment_w_design,
+            s.trigger_hwnd.map(|h| h.to_hwnd()),
+            s.widget_visible,
         )
     };
 
@@ -1672,9 +1701,14 @@ fn position_at_taskbar() {
 
     let widget_height = sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+    let trigger_size = sc(action_window::TRIGGER_SIZE);
+    let trigger_gap = sc(action_window::TRIGGER_GAP);
+    let trigger_extent = trigger_size + trigger_gap;
+    let widget_x_embed =
+        tray_left - taskbar_rect.left - widget_width - trigger_extent - tray_offset;
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
+        let x = widget_x_embed;
         native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
         diagnose::log(format!(
             "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
@@ -1682,11 +1716,39 @@ fn position_at_taskbar() {
         ));
     } else {
         // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
+        let x = tray_left - widget_width - trigger_extent - tray_offset;
         native_interop::move_window(hwnd, x, y, widget_width, widget_height);
         diagnose::log(format!(
             "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
+    }
+
+    if let Some(trigger_hwnd) = trigger_hwnd {
+        let trigger_y_screen = y + (widget_height - trigger_size) / 2;
+        let trigger_x_embed = widget_x_embed + widget_width + trigger_gap;
+        if embedded {
+            native_interop::move_window(
+                trigger_hwnd,
+                trigger_x_embed,
+                trigger_y_screen - taskbar_rect.top,
+                trigger_size,
+                trigger_size,
+            );
+        } else {
+            let trigger_x_screen = tray_left - trigger_size - tray_offset;
+            native_interop::move_window(
+                trigger_hwnd,
+                trigger_x_screen,
+                trigger_y_screen,
+                trigger_size,
+                trigger_size,
+            );
+        }
+        action_window::paint_trigger(trigger_hwnd, trigger_size, trigger_size);
+        unsafe {
+            let show = if widget_visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
+            let _ = ShowWindow(trigger_hwnd, show);
+        }
     }
 }
 
@@ -1828,13 +1890,24 @@ fn auto_resize_to_current_region() {
     };
     let widget_center_x = (widget_rect.left + widget_rect.right) / 2;
 
-    let mut occupants = crate::highlight::compute_debug_rects(taskbar_hwnd, &[widget_hwnd]);
+    let trigger_hwnd = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .and_then(|s| s.trigger_hwnd.map(|h| h.to_hwnd()))
+    };
+    let exclude: Vec<HWND> = match trigger_hwnd {
+        Some(t) => vec![widget_hwnd, t],
+        None => vec![widget_hwnd],
+    };
+    let mut occupants = crate::highlight::compute_debug_rects(taskbar_hwnd, &exclude);
     occupants.extend(crate::highlight::cached_uia_occupants());
     let regions =
         crate::highlight::open_regions_from_occupants(taskbar_rect, &occupants);
 
-    // A region must fit the widget at minimum segment width to be considered.
-    let min_widget_w = total_widget_width(MIN_SEGMENT_W);
+    // A region must fit the widget AND its trigger button at minimum segment
+    // width to be considered.
+    let min_footprint_w = total_footprint_width(MIN_SEGMENT_W);
 
     // Prefer the region the widget currently sits in; if that region no
     // longer fits the widget (e.g., a new pinned app squeezed it), fall back
@@ -1844,7 +1917,7 @@ fn auto_resize_to_current_region() {
         .find(|r| widget_center_x >= r.rect.left && widget_center_x < r.rect.right)
         .copied();
     let containing_fits = containing
-        .map(|r| (r.rect.right - r.rect.left) >= min_widget_w)
+        .map(|r| (r.rect.right - r.rect.left) >= min_footprint_w)
         .unwrap_or(false);
 
     let region = if containing_fits {
@@ -1852,7 +1925,7 @@ fn auto_resize_to_current_region() {
     } else {
         match regions
             .iter()
-            .filter(|r| (r.rect.right - r.rect.left) >= min_widget_w)
+            .filter(|r| (r.rect.right - r.rect.left) >= min_footprint_w)
             .min_by_key(|r| {
                 let center = (r.rect.left + r.rect.right) / 2;
                 (center - widget_center_x).abs()
@@ -1870,8 +1943,9 @@ fn auto_resize_to_current_region() {
     }
     let dpi = CURRENT_DPI.load(Ordering::Relaxed).max(1) as i32;
     let region_w_design = region_w_physical * 96 / dpi;
+    let usable_design = region_w_design - action_window::TRIGGER_SIZE - action_window::TRIGGER_GAP;
     let bars_design =
-        region_w_design - FIXED_NON_BAR_DESIGN_WIDTH - (SEGMENT_COUNT - 1) * SEGMENT_GAP;
+        usable_design - FIXED_NON_BAR_DESIGN_WIDTH - (SEGMENT_COUNT - 1) * SEGMENT_GAP;
     let new_seg = (bars_design / SEGMENT_COUNT).clamp(MIN_SEGMENT_W, MAX_SEGMENT_W);
     let new_widget_w = total_widget_width(new_seg);
 
@@ -2080,8 +2154,18 @@ unsafe extern "system" fn wnd_proc(
                         // Combine fresh legacy HWND occupants with the cached
                         // UIA occupants (refreshed at startup and after each
                         // drag end).
+                        let trigger_hwnd = {
+                            let state = lock_state();
+                            state
+                                .as_ref()
+                                .and_then(|s| s.trigger_hwnd.map(|h| h.to_hwnd()))
+                        };
+                        let exclude: Vec<HWND> = match trigger_hwnd {
+                            Some(t) => vec![hwnd, t],
+                            None => vec![hwnd],
+                        };
                         let mut occupants =
-                            crate::highlight::compute_debug_rects(taskbar_hwnd, &[hwnd]);
+                            crate::highlight::compute_debug_rects(taskbar_hwnd, &exclude);
                         occupants.extend(crate::highlight::cached_uia_occupants());
 
                         let mut regions = crate::highlight::open_regions_from_occupants(
@@ -2090,10 +2174,11 @@ unsafe extern "system" fn wnd_proc(
                         );
 
                         // A region is only a valid snap target if the widget
-                        // can fit inside it at the minimum allowed segment
-                        // width (5 design-px per progress-bar rectangle).
-                        let min_widget_w = total_widget_width(MIN_SEGMENT_W);
-                        regions.retain(|r| (r.rect.right - r.rect.left) >= min_widget_w);
+                        // and its trigger button can fit inside it at the
+                        // minimum allowed segment width (5 design-px per
+                        // progress-bar rectangle).
+                        let min_footprint_w = total_footprint_width(MIN_SEGMENT_W);
+                        regions.retain(|r| (r.rect.right - r.rect.left) >= min_footprint_w);
 
                         let mut overlay_hwnds =
                             crate::highlight::show_highlights(taskbar_hwnd, &regions);
@@ -2160,7 +2245,8 @@ unsafe extern "system" fn wnd_proc(
                                 }
                             }
                             let widget_width = total_widget_width(s.segment_w_design);
-                            let max_offset = tray_left - taskbar_rect.left - widget_width;
+                            let footprint_width = total_footprint_width(s.segment_w_design);
+                            let max_offset = tray_left - taskbar_rect.left - footprint_width;
                             if new_offset > max_offset {
                                 new_offset = max_offset;
                             }
@@ -2172,11 +2258,14 @@ unsafe extern "system" fn wnd_proc(
                             let anchor_height = taskbar_height;
                             let widget_height = sc(WIDGET_HEIGHT);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+                            let trigger_extent =
+                                sc(action_window::TRIGGER_SIZE) + sc(action_window::TRIGGER_GAP);
                             let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
+                                tray_left - taskbar_rect.left - widget_width - trigger_extent - new_offset
                             } else {
-                                tray_left - widget_width - new_offset
+                                tray_left - widget_width - trigger_extent - new_offset
                             };
+                            let trigger_hwnd = s.trigger_hwnd.map(|h| h.to_hwnd());
                             Some((
                                 hwnd_val,
                                 embedded,
@@ -2185,6 +2274,7 @@ unsafe extern "system" fn wnd_proc(
                                 taskbar_rect.top,
                                 widget_width,
                                 widget_height,
+                                trigger_hwnd,
                             ))
                         } else {
                             s.tray_offset = new_offset;
@@ -2196,8 +2286,16 @@ unsafe extern "system" fn wnd_proc(
                     }
                 };
 
-                if let Some((hwnd_val, embedded, x, y, taskbar_top, widget_width, widget_height)) =
-                    move_target
+                if let Some((
+                    hwnd_val,
+                    embedded,
+                    x,
+                    y,
+                    taskbar_top,
+                    widget_width,
+                    widget_height,
+                    trigger_hwnd,
+                )) = move_target
                 {
                     if embedded {
                         native_interop::move_window(
@@ -2209,6 +2307,29 @@ unsafe extern "system" fn wnd_proc(
                         );
                     } else {
                         native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
+                    }
+                    if let Some(trigger_hwnd) = trigger_hwnd {
+                        let trigger_size = sc(action_window::TRIGGER_SIZE);
+                        let trigger_gap = sc(action_window::TRIGGER_GAP);
+                        let trigger_y_screen = y + (widget_height - trigger_size) / 2;
+                        let trigger_x = x + widget_width + trigger_gap;
+                        if embedded {
+                            native_interop::move_window(
+                                trigger_hwnd,
+                                trigger_x,
+                                trigger_y_screen - taskbar_top,
+                                trigger_size,
+                                trigger_size,
+                            );
+                        } else {
+                            native_interop::move_window(
+                                trigger_hwnd,
+                                trigger_x,
+                                trigger_y_screen,
+                                trigger_size,
+                                trigger_size,
+                            );
+                        }
                     }
                 }
 
@@ -2427,12 +2548,18 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            let hook = {
+            let (hook, trigger_hwnd) = {
                 let state = lock_state();
-                state.as_ref().and_then(|s| s.win_event_hook)
+                match state.as_ref() {
+                    Some(s) => (s.win_event_hook, s.trigger_hwnd.map(|h| h.to_hwnd())),
+                    None => (None, None),
+                }
             };
             if let Some(h) = hook {
                 native_interop::unhook_win_event(h);
+            }
+            if let Some(t) = trigger_hwnd {
+                let _ = DestroyWindow(t);
             }
             tray_icon::remove(hwnd);
             PostQuitMessage(0);
