@@ -14,11 +14,13 @@ const TRAY_ICON_ID: u32 = 1;
 
 /// Menu item ID for toggling widget visibility (used by window.rs context menu).
 pub const IDM_TOGGLE_WIDGET: u16 = 50;
+/// Menu item ID for opening the action window panel.
+pub const IDM_OPEN_PANEL: u16 = 51;
 
 /// Actions the tray message handler can request from the main window.
 pub enum TrayAction {
     None,
-    ToggleWidget,
+    OpenPanel,
     ShowContextMenu,
 }
 
@@ -330,7 +332,7 @@ pub fn remove(hwnd: HWND) {
 pub fn handle_message(lparam: LPARAM) -> TrayAction {
     let mouse_msg = lparam.0 as u32;
     match mouse_msg {
-        WM_LBUTTONUP => TrayAction::ToggleWidget,
+        WM_LBUTTONUP => TrayAction::OpenPanel,
         WM_RBUTTONUP => TrayAction::ShowContextMenu,
         _ => TrayAction::None,
     }

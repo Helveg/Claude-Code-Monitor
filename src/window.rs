@@ -2531,14 +2531,17 @@ unsafe extern "system" fn wnd_proc(
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
+                id if id == tray_icon::IDM_OPEN_PANEL => {
+                    crate::action_window::open_panel();
+                }
                 _ => {}
             }
             LRESULT(0)
         }
         _ if msg == WM_APP_TRAY => {
             match tray_icon::handle_message(lparam) {
-                tray_icon::TrayAction::ToggleWidget => {
-                    toggle_widget_visibility(hwnd);
+                tray_icon::TrayAction::OpenPanel => {
+                    crate::action_window::open_panel();
                 }
                 tray_icon::TrayAction::ShowContextMenu => {
                     show_context_menu(hwnd);
@@ -2604,6 +2607,18 @@ fn show_context_menu(hwnd: HWND) {
         };
 
         let menu = CreatePopupMenu().unwrap();
+
+        let open_str = native_interop::wide_str("Open");
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            tray_icon::IDM_OPEN_PANEL as usize,
+            PCWSTR::from_raw(open_str.as_ptr()),
+        );
+        // Mark as the default item — Windows renders the default in bold and
+        // it's what a double-click of the tray icon would invoke.
+        let _ = SetMenuDefaultItem(menu, tray_icon::IDM_OPEN_PANEL as u32, 0);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let refresh_str = native_interop::wide_str(strings.refresh);
         let _ = AppendMenuW(

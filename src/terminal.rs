@@ -1019,14 +1019,22 @@ pub struct Terminal {
     pub cols: u16,
     pub rows: u16,
     closed: Arc<AtomicBool>,
+    paint_pending: Arc<AtomicBool>,
 }
 
 impl Terminal {
-    pub fn spawn(cols: u16, rows: u16, cmd: &str, notify_hwnd: HWND) -> Result<Self, String> {
+    pub fn spawn(
+        cols: u16,
+        rows: u16,
+        cmd: &str,
+        notify_hwnd: HWND,
+        notify_msg: u32,
+    ) -> Result<Self, String> {
         let pty_inner = unsafe { spawn_pty(cols, rows, cmd)? };
         let grid = Arc::new(Mutex::new(Grid::new(cols, rows)));
         let pty = Arc::new(Mutex::new(Some(pty_inner)));
         let closed = Arc::new(AtomicBool::new(false));
+        let paint_pending = Arc::new(AtomicBool::new(false));
 
         let h_out_read_addr: isize = {
             let guard = pty.lock().map_err(|_| "pty mutex poisoned")?;
@@ -1035,10 +1043,18 @@ impl Terminal {
 
         let grid_for_thread = Arc::clone(&grid);
         let closed_for_thread = Arc::clone(&closed);
+        let paint_pending_for_thread = Arc::clone(&paint_pending);
         let notify = notify_hwnd.0 as isize;
         thread::spawn(move || {
             let h = HANDLE(h_out_read_addr as *mut _);
-            output_reader_loop(h, grid_for_thread, closed_for_thread, notify);
+            output_reader_loop(
+                h,
+                grid_for_thread,
+                closed_for_thread,
+                paint_pending_for_thread,
+                notify,
+                notify_msg,
+            );
         });
 
         Ok(Self {
@@ -1047,7 +1063,12 @@ impl Terminal {
             cols,
             rows,
             closed,
+            paint_pending,
         })
+    }
+
+    pub fn paint_pending(&self) -> &Arc<AtomicBool> {
+        &self.paint_pending
     }
 
     pub fn write_input(&self, data: &[u8]) {
@@ -1236,7 +1257,9 @@ fn output_reader_loop(
     h_out_read: HANDLE,
     grid: Arc<Mutex<Grid>>,
     closed: Arc<AtomicBool>,
+    paint_pending: Arc<AtomicBool>,
     notify_hwnd: isize,
+    notify_msg: u32,
 ) {
     let mut parser = Parser::new();
     let mut buf = [0u8; 4096];
@@ -1265,15 +1288,15 @@ fn output_reader_loop(
             };
             parser.feed(&mut g, &buf[..n as usize]);
         }
-        // Coalesce repaints: only post a fresh WM_APP_TERM_OUTPUT if the
-        // previous one hasn't been processed yet. The UI handler clears the
-        // flag before painting, so any output produced during the paint will
-        // trigger exactly one follow-up paint instead of a storm.
-        if !crate::action_window::TERM_PAINT_PENDING.swap(true, Ordering::AcqRel) {
+        // Coalesce repaints: only post a fresh notification if the previous
+        // one hasn't been consumed yet. The UI side clears the flag before
+        // painting, so output that arrives during a paint triggers exactly
+        // one follow-up paint.
+        if !paint_pending.swap(true, Ordering::AcqRel) {
             unsafe {
                 let _ = PostMessageW(
                     HWND(notify_hwnd as *mut _),
-                    crate::action_window::WM_APP_TERM_OUTPUT,
+                    notify_msg,
                     WPARAM(0),
                     LPARAM(0),
                 );

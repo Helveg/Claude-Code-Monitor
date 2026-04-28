@@ -3,7 +3,9 @@
 mod action_window;
 mod diagnose;
 mod highlight;
+mod session_view;
 mod terminal;
+mod terminal_view;
 mod localization;
 mod models;
 mod native_interop;
