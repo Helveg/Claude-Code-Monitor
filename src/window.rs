@@ -12,7 +12,10 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Controls::{WM_MOUSEHOVER, WM_MOUSELEAVE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_HOVER, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -84,8 +87,8 @@ struct AppState {
     segment_w_design: i32,
 
     widget_visible: bool,
-
-    trigger_hwnd: Option<SendHwnd>,
+    layout_tier: LayoutTier,
+    tooltip_hwnd: Option<SendHwnd>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +210,8 @@ struct SettingsFile {
     widget_visible: bool,
     #[serde(default = "default_segment_w_design")]
     segment_w_design: i32,
+    #[serde(default)]
+    layout_tier: LayoutTier,
 }
 
 impl Default for SettingsFile {
@@ -218,6 +223,7 @@ impl Default for SettingsFile {
             last_update_check_unix: None,
             widget_visible: true,
             segment_w_design: default_segment_w_design(),
+            layout_tier: LayoutTier::default(),
         }
     }
 }
@@ -264,6 +270,7 @@ fn save_state_settings() {
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             segment_w_design: s.segment_w_design,
+            layout_tier: s.layout_tier,
         });
     }
 }
@@ -271,20 +278,307 @@ fn save_state_settings() {
 fn tray_icon_data_from_state() -> (Option<f64>, String) {
     let state = lock_state();
     match state.as_ref() {
-        Some(s) if s.last_poll_ok => {
-            let tooltip = format!("5h: {} | 7d: {}", s.session_text, s.weekly_text);
-            (Some(s.session_percent), tooltip)
-        }
+        Some(s) if s.last_poll_ok => (Some(s.session_percent), widget_tooltip_text(s)),
         _ => (None, "Claude Code Usage Monitor".to_string()),
     }
 }
 
+/// Full-info text shown in the widget hover tooltip and tray tooltip.
+/// Always includes both rows with their localized window labels so users
+/// can read the data even in the most-minified tiers (and so Korean /
+/// Chinese labels truncated in compact rendering are still legible).
+fn widget_tooltip_text(s: &AppState) -> String {
+    if !s.last_poll_ok {
+        return "Claude Code Usage Monitor".to_string();
+    }
+    let strings = s.language.strings();
+    format!(
+        "{}: {}\n{}: {}",
+        strings.session_window, s.session_text, strings.weekly_window, s.weekly_text
+    )
+}
+
+// Custom hover tooltip — a tiny owner-less WS_POPUP that we paint
+// ourselves. Avoids the comctl32 tooltip control entirely: that control,
+// when attached to our widget (a WS_CHILD of the taskbar), was hanging
+// the taskbar at startup. With our own popup we control z-order, owner
+// chain, and message routing — none of which touch explorer.exe.
+
+const TOOLTIP_CLASS: &str = "ClaudeCodeUsageMonitorTooltip";
+const TOOLTIP_PADDING_X: i32 = 8;
+const TOOLTIP_PADDING_Y: i32 = 6;
+const TOOLTIP_HOVER_MS: u32 = 400;
+
+/// Latest tooltip text. Read by the tooltip's WM_PAINT.
+static TOOLTIP_TEXT: Mutex<String> = Mutex::new(String::new());
+
+fn register_tooltip_class(hinstance: HINSTANCE) {
+    unsafe {
+        let class_name = native_interop::wide_str(TOOLTIP_CLASS);
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(tooltip_wnd_proc),
+            hInstance: hinstance,
+            hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            ..Default::default()
+        };
+        let atom = RegisterClassExW(&wc);
+        if atom == 0 {
+            diagnose::log("tooltip RegisterClassExW returned 0");
+        }
+    }
+}
+
+/// Lazily create the tooltip popup window the first time we need to show
+/// it. Owner is NULL so the popup is not tied to the taskbar's hierarchy.
+fn ensure_tooltip_window() -> Option<HWND> {
+    let existing = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| s.tooltip_hwnd).map(|h| h.to_hwnd())
+    };
+    if let Some(h) = existing {
+        return Some(h);
+    }
+    unsafe {
+        let hinstance = HINSTANCE(GetModuleHandleW(PCWSTR::null()).ok()?.0);
+        let class_name = native_interop::wide_str(TOOLTIP_CLASS);
+        let title = native_interop::wide_str("");
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::from_raw(title.as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        )
+        .ok()?;
+        if hwnd == HWND::default() {
+            return None;
+        }
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.tooltip_hwnd = Some(SendHwnd::from_hwnd(hwnd));
+        }
+        Some(hwnd)
+    }
+}
+
+/// Push the latest tooltip text into the global cache and ask the tooltip
+/// window (if visible) to repaint. Called after every poll / language /
+/// countdown change.
+fn update_widget_tooltip() {
+    let (tip_hwnd, text) = {
+        let state = lock_state();
+        let s = match state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        (s.tooltip_hwnd.map(|h| h.to_hwnd()), widget_tooltip_text(s))
+    };
+    if let Ok(mut cache) = TOOLTIP_TEXT.lock() {
+        if *cache == text {
+            return;
+        }
+        *cache = text;
+    }
+    if let Some(h) = tip_hwnd {
+        unsafe {
+            let _ = InvalidateRect(h, None, true);
+        }
+    }
+}
+
+fn measure_tooltip(hdc: HDC, text: &str) -> (i32, i32) {
+    if text.is_empty() {
+        return (0, 0);
+    }
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: sc(360),
+        bottom: 0,
+    };
+    unsafe {
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rect,
+            DT_CALCRECT | DT_LEFT | DT_NOPREFIX,
+        );
+    }
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
+fn show_tooltip_at(anchor_screen_y_top: i32, cursor_screen_x: i32) {
+    let text = TOOLTIP_TEXT.lock().map(|s| s.clone()).unwrap_or_default();
+    if text.is_empty() {
+        return;
+    }
+    let hwnd = match ensure_tooltip_window() {
+        Some(h) => h,
+        None => return,
+    };
+    unsafe {
+        let screen_dc = GetDC(HWND::default());
+        let font_name = native_interop::wide_str("Segoe UI");
+        let font = CreateFontW(
+            sc(-12),
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(screen_dc, font);
+        let (text_w, text_h) = measure_tooltip(screen_dc, &text);
+        SelectObject(screen_dc, old_font);
+        let _ = DeleteObject(font);
+        ReleaseDC(HWND::default(), screen_dc);
+
+        let w = text_w + sc(TOOLTIP_PADDING_X) * 2;
+        let h = text_h + sc(TOOLTIP_PADDING_Y) * 2;
+        let x = cursor_screen_x - w / 2;
+        let y = anchor_screen_y_top - h - sc(4);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            w,
+            h,
+            SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = InvalidateRect(hwnd, None, true);
+    }
+}
+
+fn hide_tooltip() {
+    let hwnd = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| s.tooltip_hwnd).map(|h| h.to_hwnd())
+    };
+    if let Some(h) = hwnd {
+        unsafe {
+            let _ = ShowWindow(h, SW_HIDE);
+        }
+    }
+}
+
+unsafe extern "system" fn tooltip_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+
+            let is_dark = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.is_dark).unwrap_or(false)
+            };
+            let bg = if is_dark {
+                native_interop::colorref(40, 40, 40)
+            } else {
+                native_interop::colorref(250, 250, 250)
+            };
+            let border = if is_dark {
+                native_interop::colorref(90, 90, 90)
+            } else {
+                native_interop::colorref(180, 180, 180)
+            };
+            let text_color = if is_dark {
+                native_interop::colorref(220, 220, 220)
+            } else {
+                native_interop::colorref(40, 40, 40)
+            };
+
+            let bg_brush = CreateSolidBrush(COLORREF(bg));
+            FillRect(hdc, &rect, bg_brush);
+            let _ = DeleteObject(bg_brush);
+
+            // 1px border
+            let border_brush = CreateSolidBrush(COLORREF(border));
+            let mut top = RECT { left: rect.left, top: rect.top, right: rect.right, bottom: rect.top + 1 };
+            let mut bot = RECT { left: rect.left, top: rect.bottom - 1, right: rect.right, bottom: rect.bottom };
+            let mut lft = RECT { left: rect.left, top: rect.top, right: rect.left + 1, bottom: rect.bottom };
+            let mut rgt = RECT { left: rect.right - 1, top: rect.top, right: rect.right, bottom: rect.bottom };
+            FillRect(hdc, &mut top, border_brush);
+            FillRect(hdc, &mut bot, border_brush);
+            FillRect(hdc, &mut lft, border_brush);
+            FillRect(hdc, &mut rgt, border_brush);
+            let _ = DeleteObject(border_brush);
+
+            let font_name = native_interop::wide_str("Segoe UI");
+            let font = CreateFontW(
+                sc(-12),
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_TT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                CLEARTYPE_QUALITY.0 as u32,
+                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                PCWSTR::from_raw(font_name.as_ptr()),
+            );
+            let old_font = SelectObject(hdc, font);
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let _ = SetTextColor(hdc, COLORREF(text_color));
+
+            let text = TOOLTIP_TEXT.lock().map(|s| s.clone()).unwrap_or_default();
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            let mut text_rect = RECT {
+                left: rect.left + sc(TOOLTIP_PADDING_X),
+                top: rect.top + sc(TOOLTIP_PADDING_Y),
+                right: rect.right - sc(TOOLTIP_PADDING_X),
+                bottom: rect.bottom - sc(TOOLTIP_PADDING_Y),
+            };
+            let _ = DrawTextW(hdc, &mut wide, &mut text_rect, DT_LEFT | DT_NOPREFIX);
+
+            SelectObject(hdc, old_font);
+            let _ = DeleteObject(font);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
 fn toggle_widget_visibility(hwnd: HWND) {
-    let (new_visible, trigger_hwnd) = {
+    let new_visible = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
             s.widget_visible = !s.widget_visible;
-            (s.widget_visible, s.trigger_hwnd.map(|h| h.to_hwnd()))
+            s.widget_visible
         } else {
             return;
         }
@@ -297,9 +591,6 @@ fn toggle_widget_visibility(hwnd: HWND) {
             render_layered();
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
-            if let Some(t) = trigger_hwnd {
-                let _ = ShowWindow(t, SW_HIDE);
-            }
         }
     }
 }
@@ -737,7 +1028,7 @@ fn set_startup_enabled(enable: bool) {
 
 // Dimensions matching the C# version
 const DEFAULT_SEGMENT_W: i32 = 10;
-const MIN_SEGMENT_W: i32 = 5;
+const MIN_SEGMENT_W: i32 = 4;
 const MAX_SEGMENT_W: i32 = 12;
 const SEGMENT_H: i32 = 13;
 const SEGMENT_GAP: i32 = 1;
@@ -753,6 +1044,18 @@ const TEXT_WIDTH: i32 = 62;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
+/// Width in design pixels of the joined "label · text" string drawn in
+/// compact mode. Sized to fit the English worst case "5h · 100% · 4d"
+/// (~78 design px) with a small buffer. Wider localised strings
+/// (Korean / Japanese) are truncated with DT_END_ELLIPSIS.
+const COMPACT_CONTENT_W: i32 = 90;
+
+/// Width for the no-label tier ("100% · 4d") — drops the "5h"/"7d" prefix.
+const NO_LABEL_CONTENT_W: i32 = 64;
+
+/// Width for the pct-only tier ("100%") — drops the countdown too.
+const PCT_ONLY_CONTENT_W: i32 = 32;
+
 /// Sum of all design-pixel widths in the widget that aren't the bar segments.
 /// Used by the snap math: given a target widget width, the bars can occupy
 /// `widget_width - sc(FIXED_NON_BAR_DESIGN_WIDTH)`.
@@ -763,6 +1066,31 @@ const FIXED_NON_BAR_DESIGN_WIDTH: i32 = LEFT_DIVIDER_W
     + BAR_RIGHT_MARGIN
     + TEXT_WIDTH
     + RIGHT_MARGIN;
+
+/// Total design-pixel width of the widget when rendered in compact mode
+/// (no progress bars — just the joined label/text per row).
+const COMPACT_WIDGET_DESIGN_WIDTH: i32 =
+    LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN + COMPACT_CONTENT_W + RIGHT_MARGIN;
+
+const NO_LABEL_WIDGET_DESIGN_WIDTH: i32 =
+    LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN + NO_LABEL_CONTENT_W + RIGHT_MARGIN;
+
+const PCT_ONLY_WIDGET_DESIGN_WIDTH: i32 =
+    LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN + PCT_ONLY_CONTENT_W + RIGHT_MARGIN;
+
+/// How the widget is rendered, in increasing order of minification.
+/// `Bars` = full progress bars. `Compact` = "5h · 100% · 4d" rows.
+/// `NoLabel` = drops the "5h"/"7d" prefix. `PctOnly` = drops the countdown
+/// too, just "100%". The full information is always available in the
+/// hover tooltip regardless of tier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum LayoutTier {
+    #[default]
+    Bars,
+    Compact,
+    NoLabel,
+    PctOnly,
+}
 
 fn total_widget_width(segment_w_design: i32) -> i32 {
     sc(LEFT_DIVIDER_W)
@@ -776,12 +1104,54 @@ fn total_widget_width(segment_w_design: i32) -> i32 {
         + sc(RIGHT_MARGIN)
 }
 
-/// Combined footprint of the widget plus the trigger button (and its gap),
-/// in physical pixels at the current DPI. The button sits to the left of the
-/// widget so the region available for the bar segments shrinks accordingly.
-fn total_footprint_width(segment_w_design: i32) -> i32 {
-    total_widget_width(segment_w_design) + sc(action_window::TRIGGER_GAP) + sc(action_window::TRIGGER_SIZE)
+fn compact_widget_width() -> i32 {
+    sc(COMPACT_WIDGET_DESIGN_WIDTH)
 }
+
+fn no_label_widget_width() -> i32 {
+    sc(NO_LABEL_WIDGET_DESIGN_WIDTH)
+}
+
+fn pct_only_widget_width() -> i32 {
+    sc(PCT_ONLY_WIDGET_DESIGN_WIDTH)
+}
+
+/// Pick widget rendering tier and width from a region width in design pixels.
+/// Returns `None` if the region can't even fit the most-minified form.
+/// Picks the most informative tier that fits.
+fn layout_for_region_width(region_w_design: i32) -> Option<(LayoutTier, i32)> {
+    let bars_design =
+        region_w_design - FIXED_NON_BAR_DESIGN_WIDTH - (SEGMENT_COUNT - 1) * SEGMENT_GAP;
+    let raw_seg = bars_design / SEGMENT_COUNT;
+    if raw_seg >= MIN_SEGMENT_W {
+        Some((LayoutTier::Bars, raw_seg.clamp(MIN_SEGMENT_W, MAX_SEGMENT_W)))
+    } else if region_w_design >= COMPACT_WIDGET_DESIGN_WIDTH {
+        Some((LayoutTier::Compact, DEFAULT_SEGMENT_W))
+    } else if region_w_design >= NO_LABEL_WIDGET_DESIGN_WIDTH {
+        Some((LayoutTier::NoLabel, DEFAULT_SEGMENT_W))
+    } else if region_w_design >= PCT_ONLY_WIDGET_DESIGN_WIDTH {
+        Some((LayoutTier::PctOnly, DEFAULT_SEGMENT_W))
+    } else {
+        None
+    }
+}
+
+/// The minimum widget footprint (physical pixels) — region must be at least
+/// this wide to fit the widget at all (in the most-minified form).
+fn min_widget_footprint() -> i32 {
+    pct_only_widget_width()
+}
+
+/// Current widget width (physical pixels) for a given tier.
+fn widget_width_for(tier: LayoutTier, segment_w_design: i32) -> i32 {
+    match tier {
+        LayoutTier::Bars => total_widget_width(segment_w_design),
+        LayoutTier::Compact => compact_widget_width(),
+        LayoutTier::NoLabel => no_label_widget_width(),
+        LayoutTier::PctOnly => pct_only_widget_width(),
+    }
+}
+
 
 pub fn run() {
     // Enable Per-Monitor DPI Awareness V2 for crisp rendering at any scale factor
@@ -836,6 +1206,7 @@ pub fn run() {
 
         crate::highlight::register_overlay_class(HINSTANCE(hinstance.0));
         action_window::register_classes(HINSTANCE(hinstance.0));
+        register_tooltip_class(HINSTANCE(hinstance.0));
 
         let settings = load_settings();
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
@@ -847,6 +1218,7 @@ pub fn run() {
         let initial_segment_w = settings
             .segment_w_design
             .clamp(MIN_SEGMENT_W, MAX_SEGMENT_W);
+        let initial_width = widget_width_for(settings.layout_tier, initial_segment_w);
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -854,7 +1226,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width(initial_segment_w),
+            initial_width,
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -922,7 +1294,8 @@ pub fn run() {
                     .segment_w_design
                     .clamp(MIN_SEGMENT_W, MAX_SEGMENT_W),
                 widget_visible: settings.widget_visible,
-                trigger_hwnd: None,
+                layout_tier: settings.layout_tier,
+                tooltip_hwnd: None,
             });
         }
 
@@ -932,40 +1305,43 @@ pub fn run() {
             native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
             embedded = true;
 
-            let mut state = lock_state();
-            let s = state.as_mut().unwrap();
-            s.taskbar_hwnd = Some(taskbar_hwnd);
-            s.embedded = true;
+            // Scoped so the STATE guard is dropped before the cross-process
+            // calls below — we don't want to hold the app-state lock across
+            // SHAppBarMessage / worker spawns / SetTimer.
+            {
+                let mut state = lock_state();
+                let s = state.as_mut().unwrap();
+                s.taskbar_hwnd = Some(taskbar_hwnd);
+                s.embedded = true;
 
-            let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
-            s.tray_notify_hwnd = tray_notify;
-            if tray_notify.is_some() {
-                diagnose::log("TrayNotifyWnd found");
-            } else {
-                diagnose::log("TrayNotifyWnd not found");
-            }
-
-            if let Some(tray_hwnd) = tray_notify {
-                let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-                let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
-                s.win_event_hook = hook;
-                if hook.is_some() {
-                    diagnose::log("tray event hook installed");
+                let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
+                s.tray_notify_hwnd = tray_notify;
+                if tray_notify.is_some() {
+                    diagnose::log("TrayNotifyWnd found");
                 } else {
-                    diagnose::log("tray event hook could not be installed");
+                    diagnose::log("TrayNotifyWnd not found");
+                }
+
+                if let Some(tray_hwnd) = tray_notify {
+                    let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+                    let hook =
+                        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
+                    s.win_event_hook = hook;
+                    if hook.is_some() {
+                        diagnose::log("tray event hook installed");
+                    } else {
+                        diagnose::log("tray event hook could not be installed");
+                    }
                 }
             }
 
-            // Pre-warm the UIA occupant cache so the first drag has data.
+            // Pre-warm both occupant caches so the first drag and the first
+            // layout tick have data without doing any cross-process
+            // enumeration on the UI thread.
             if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
                 crate::highlight::spawn_uia_scan(taskbar_hwnd, taskbar_rect);
             }
-
-            // Trigger button: orange rounded square embedded next to the widget.
-            if let Some(trigger_hwnd) = action_window::create_trigger(HINSTANCE(hinstance.0)) {
-                native_interop::embed_in_taskbar(trigger_hwnd, taskbar_hwnd);
-                s.trigger_hwnd = Some(SendHwnd::from_hwnd(trigger_hwnd));
-            }
+            crate::highlight::spawn_hwnd_scan(taskbar_hwnd, hwnd);
 
             // Win11 pinned-app changes happen entirely in XAML and don't fire
             // Win32 LOCATIONCHANGE events, so the tray-hook path can't see them.
@@ -1005,6 +1381,7 @@ pub fn run() {
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
+        update_widget_tooltip();
 
         // Poll timer: 15 minutes
         let initial_poll_ms = {
@@ -1062,6 +1439,7 @@ fn render_layered() {
         weekly_pct,
         weekly_text,
         segment_w_design,
+        layout_tier,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1075,6 +1453,7 @@ fn render_layered() {
                 s.weekly_percent,
                 s.weekly_text.clone(),
                 s.segment_w_design,
+                s.layout_tier,
             ),
             None => return,
         }
@@ -1090,7 +1469,7 @@ fn render_layered() {
         return;
     }
 
-    let width = total_widget_width(segment_w_design);
+    let width = widget_width_for(layout_tier, segment_w_design);
     let height = sc(WIDGET_HEIGHT);
 
     let accent = Color::from_hex("#D97757");
@@ -1158,6 +1537,7 @@ fn render_layered() {
             weekly_pct,
             &weekly_text,
             segment_w_design,
+            layout_tier,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1222,6 +1602,7 @@ fn paint_content(
     weekly_pct: f64,
     weekly_text: &str,
     segment_w_design: i32,
+    layout_tier: LayoutTier,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1298,31 +1679,88 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        draw_row(
-            hdc,
-            content_x,
-            row1_y,
-            strings.session_window,
-            session_pct,
-            session_text,
-            accent,
-            track,
-            segment_w_design,
-        );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
-            strings.weekly_window,
-            weekly_pct,
-            weekly_text,
-            accent,
-            track,
-            segment_w_design,
-        );
+        match layout_tier {
+            LayoutTier::Compact => {
+                draw_compact_row(
+                    hdc,
+                    content_x,
+                    row1_y,
+                    strings.session_window,
+                    session_text,
+                    COMPACT_CONTENT_W,
+                );
+                draw_compact_row(
+                    hdc,
+                    content_x,
+                    row2_y,
+                    strings.weekly_window,
+                    weekly_text,
+                    COMPACT_CONTENT_W,
+                );
+            }
+            LayoutTier::NoLabel => {
+                draw_text_row(hdc, content_x, row1_y, session_text, NO_LABEL_CONTENT_W);
+                draw_text_row(hdc, content_x, row2_y, weekly_text, NO_LABEL_CONTENT_W);
+            }
+            LayoutTier::PctOnly => {
+                let session_only = format!("{:.0}%", session_pct);
+                let weekly_only = format!("{:.0}%", weekly_pct);
+                draw_text_row(hdc, content_x, row1_y, &session_only, PCT_ONLY_CONTENT_W);
+                draw_text_row(hdc, content_x, row2_y, &weekly_only, PCT_ONLY_CONTENT_W);
+            }
+            LayoutTier::Bars => {
+                draw_row(
+                    hdc,
+                    content_x,
+                    row1_y,
+                    strings.session_window,
+                    session_pct,
+                    session_text,
+                    accent,
+                    track,
+                    segment_w_design,
+                );
+                draw_row(
+                    hdc,
+                    content_x,
+                    row2_y,
+                    strings.weekly_window,
+                    weekly_pct,
+                    weekly_text,
+                    accent,
+                    track,
+                    segment_w_design,
+                );
+            }
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
+    }
+}
+
+/// Compact-mode row: a single text line "{label} · {text}" with no progress bar.
+fn draw_compact_row(hdc: HDC, x: i32, y: i32, label: &str, text: &str, content_w_design: i32) {
+    let combined = format!("{label} \u{00b7} {text}");
+    draw_text_row(hdc, x, y, &combined, content_w_design);
+}
+
+/// No-label row: just `text`, ellipsised if it overflows the available width.
+fn draw_text_row(hdc: HDC, x: i32, y: i32, text: &str, content_w_design: i32) {
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut rect = RECT {
+        left: x,
+        top: y,
+        right: x + sc(content_w_design),
+        bottom: y + sc(SEGMENT_H),
+    };
+    unsafe {
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
     }
 }
 
@@ -1515,6 +1953,7 @@ fn check_theme_change() {
 fn check_language_change() {
     if update_language_change() {
         render_layered();
+        update_widget_tooltip();
     }
 }
 
@@ -1545,15 +1984,10 @@ fn offset_for_region(
     region: &crate::highlight::HighlightRegion,
     widget_width: i32,
 ) -> i32 {
-    let trigger_extent = sc(action_window::TRIGGER_SIZE) + sc(action_window::TRIGGER_GAP);
     let taskbar_center = (taskbar_rect.left + taskbar_rect.right) / 2;
     let region_center = (region.rect.left + region.rect.right) / 2;
-    // The trigger button sits to the right of the widget, so the rightmost
-    // edge of the footprint is the trigger's right edge. tray_offset is the
-    // distance from that edge back to tray_left.
     let footprint_right = if region_center < taskbar_center {
-        // Left-align: widget snugs against region.left, trigger follows on its right.
-        region.rect.left + widget_width + trigger_extent
+        region.rect.left + widget_width
     } else {
         region.rect.right
     };
@@ -1572,11 +2006,11 @@ fn snap_widget_to_region(taskbar_hwnd: HWND, region: &crate::highlight::Highligh
 
     let dpi = CURRENT_DPI.load(Ordering::Relaxed).max(1) as i32;
     let region_w_design = region_w_physical * 96 / dpi;
-    let usable_design = region_w_design - action_window::TRIGGER_SIZE - action_window::TRIGGER_GAP;
-    let bars_design =
-        usable_design - FIXED_NON_BAR_DESIGN_WIDTH - (SEGMENT_COUNT - 1) * SEGMENT_GAP;
-    let new_segment_w = (bars_design / SEGMENT_COUNT).clamp(MIN_SEGMENT_W, MAX_SEGMENT_W);
-    let new_widget_w_physical = total_widget_width(new_segment_w);
+    let (tier, new_segment_w) = match layout_for_region_width(region_w_design) {
+        Some(v) => v,
+        None => return,
+    };
+    let new_widget_w_physical = widget_width_for(tier, new_segment_w);
 
     let mut tray_left = taskbar_rect.right;
     if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
@@ -1591,7 +2025,10 @@ fn snap_widget_to_region(taskbar_hwnd: HWND, region: &crate::highlight::Highligh
     {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            s.segment_w_design = new_segment_w;
+            s.layout_tier = tier;
+            if matches!(tier, LayoutTier::Bars) {
+                s.segment_w_design = new_segment_w;
+            }
             s.tray_offset = new_offset;
         }
     }
@@ -1647,7 +2084,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd, segment_w_design, trigger_hwnd, widget_visible) = {
+    let (hwnd, embedded, tray_offset, taskbar_hwnd, segment_w_design, layout_tier) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -1673,8 +2110,7 @@ fn position_at_taskbar() {
             s.tray_offset,
             taskbar_hwnd,
             s.segment_w_design,
-            s.trigger_hwnd.map(|h| h.to_hwnd()),
-            s.widget_visible,
+            s.layout_tier,
         )
     };
 
@@ -1697,18 +2133,52 @@ fn position_at_taskbar() {
         }
     }
 
-    let widget_width = total_widget_width(segment_w_design);
+    // Pick the widest layout that fits between taskbar.left and tray_left.
+    // If the saved tier doesn't fit the available width, step down through
+    // the tiers until one does. Self-heals state from older sessions where
+    // the taskbar was wider, or where another app shrunk the available
+    // space below the bar minimum.
+    let avail = (tray_left - taskbar_rect.left).max(0);
+    let mut effective_tier = layout_tier;
+    let mut widget_width = widget_width_for(effective_tier, segment_w_design);
+    while widget_width > avail {
+        let next = match effective_tier {
+            LayoutTier::Bars => LayoutTier::Compact,
+            LayoutTier::Compact => LayoutTier::NoLabel,
+            LayoutTier::NoLabel => LayoutTier::PctOnly,
+            LayoutTier::PctOnly => break,
+        };
+        effective_tier = next;
+        widget_width = widget_width_for(effective_tier, segment_w_design);
+    }
+
+    // Clamp tray_offset so the widget can never be positioned past the left
+    // edge of the taskbar. Persist any correction so it doesn't drift.
+    let max_offset = (avail - widget_width).max(0);
+    let effective_offset = tray_offset.clamp(0, max_offset);
+    if effective_offset != tray_offset || effective_tier != layout_tier {
+        // Drop the STATE guard before calling save_state_settings(), which
+        // re-acquires STATE — std::sync::Mutex is non-reentrant, so holding
+        // the guard across the call would deadlock the UI thread.
+        {
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                if effective_offset != tray_offset {
+                    s.tray_offset = effective_offset;
+                }
+                if effective_tier != layout_tier {
+                    s.layout_tier = effective_tier;
+                }
+            }
+        }
+        save_state_settings();
+    }
 
     let widget_height = sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-    let trigger_size = sc(action_window::TRIGGER_SIZE);
-    let trigger_gap = sc(action_window::TRIGGER_GAP);
-    let trigger_extent = trigger_size + trigger_gap;
-    let widget_x_embed =
-        tray_left - taskbar_rect.left - widget_width - trigger_extent - tray_offset;
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
-        let x = widget_x_embed;
+        let x = tray_left - taskbar_rect.left - widget_width - effective_offset;
         native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
         diagnose::log(format!(
             "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
@@ -1716,39 +2186,11 @@ fn position_at_taskbar() {
         ));
     } else {
         // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - trigger_extent - tray_offset;
+        let x = tray_left - widget_width - effective_offset;
         native_interop::move_window(hwnd, x, y, widget_width, widget_height);
         diagnose::log(format!(
             "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
-    }
-
-    if let Some(trigger_hwnd) = trigger_hwnd {
-        let trigger_y_screen = y + (widget_height - trigger_size) / 2;
-        let trigger_x_embed = widget_x_embed + widget_width + trigger_gap;
-        if embedded {
-            native_interop::move_window(
-                trigger_hwnd,
-                trigger_x_embed,
-                trigger_y_screen - taskbar_rect.top,
-                trigger_size,
-                trigger_size,
-            );
-        } else {
-            let trigger_x_screen = tray_left - trigger_size - tray_offset;
-            native_interop::move_window(
-                trigger_hwnd,
-                trigger_x_screen,
-                trigger_y_screen,
-                trigger_size,
-                trigger_size,
-            );
-        }
-        action_window::paint_trigger(trigger_hwnd, trigger_size, trigger_size);
-        unsafe {
-            let show = if widget_visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
-            let _ = ShowWindow(trigger_hwnd, show);
-        }
     }
 }
 
@@ -1824,24 +2266,30 @@ unsafe extern "system" fn on_tray_location_changed(
         return;
     }
 
-    auto_resize_to_current_region();
-    position_at_taskbar();
-    render_layered();
+    // Refresh both caches on background workers. `auto_resize_to_current_region`
+    // reads from the caches and calls position+render itself when something
+    // actually changed — no need to call them unconditionally here.
     crate::highlight::spawn_uia_scan(taskbar_hwnd, taskbar_rect);
+    crate::highlight::spawn_hwnd_scan(taskbar_hwnd, widget_hwnd);
+    auto_resize_to_current_region();
 }
 
 /// Periodic tick: catches Win11 XAML pin/unpin changes that don't fire
 /// Win32 LOCATIONCHANGE events. Also a safety net for any layout changes
 /// the event hook misses.
+///
+/// All cross-process enumeration (EnumWindows + per-HWND queries, UIA
+/// walk) happens on background workers. This handler only kicks them off
+/// and reads from caches — it never blocks on explorer.exe RPC.
 fn layout_refresh_tick() {
-    let (taskbar_hwnd, dragging) = {
+    let (taskbar_hwnd, dragging, widget_visible, widget_hwnd) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (s.taskbar_hwnd, s.dragging),
+            Some(s) => (s.taskbar_hwnd, s.dragging, s.widget_visible, s.hwnd.to_hwnd()),
             None => return,
         }
     };
-    if dragging {
+    if dragging || !widget_visible {
         return;
     }
     let taskbar_hwnd = match taskbar_hwnd {
@@ -1849,23 +2297,25 @@ fn layout_refresh_tick() {
         None => return,
     };
 
-    // 1. Spawn a UIA cache refresh so the next tick (and the next drag) sees
-    //    fresh XAML occupants.
+    // Refresh both caches off the UI thread. The next tick (and the next
+    // drag) will see fresh occupants. In-flight guards keep the workers
+    // from stacking up.
     if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
         crate::highlight::spawn_uia_scan(taskbar_hwnd, taskbar_rect);
     }
+    crate::highlight::spawn_hwnd_scan(taskbar_hwnd, widget_hwnd);
 
-    // 2. Re-evaluate the widget's region using the cached UIA + fresh HWND
-    //    occupants. Only re-renders if the segment width actually changes.
+    // Re-evaluate the widget's region using the cached occupants only.
+    // `auto_resize_to_current_region` no-ops when nothing changed and
+    // calls position+render itself when it does — no need to re-do them
+    // here.
     auto_resize_to_current_region();
-    position_at_taskbar();
-    render_layered();
 }
 
 /// Recompute the widget's segment width to match whichever open region it
 /// currently sits in. Called on layout-change events outside of an active drag.
 fn auto_resize_to_current_region() {
-    let (taskbar_hwnd, widget_hwnd, current_seg) = {
+    let (taskbar_hwnd, widget_hwnd, current_seg, current_tier) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -1875,7 +2325,7 @@ fn auto_resize_to_current_region() {
             return;
         }
         match s.taskbar_hwnd {
-            Some(tb) => (tb, s.hwnd.to_hwnd(), s.segment_w_design),
+            Some(tb) => (tb, s.hwnd.to_hwnd(), s.segment_w_design, s.layout_tier),
             None => return,
         }
     };
@@ -1890,24 +2340,20 @@ fn auto_resize_to_current_region() {
     };
     let widget_center_x = (widget_rect.left + widget_rect.right) / 2;
 
-    let trigger_hwnd = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .and_then(|s| s.trigger_hwnd.map(|h| h.to_hwnd()))
-    };
-    let exclude: Vec<HWND> = match trigger_hwnd {
-        Some(t) => vec![widget_hwnd, t],
-        None => vec![widget_hwnd],
-    };
-    let mut occupants = crate::highlight::compute_debug_rects(taskbar_hwnd, &exclude);
+    // Read the cached occupants — both caches are refreshed on background
+    // workers so this path never blocks on explorer.exe RPC. If the caches
+    // are empty (very first tick before workers complete), do nothing this
+    // tick; the next tick will have fresh data.
+    let mut occupants = crate::highlight::cached_hwnd_occupants();
     occupants.extend(crate::highlight::cached_uia_occupants());
+    if occupants.is_empty() {
+        return;
+    }
     let regions =
         crate::highlight::open_regions_from_occupants(taskbar_rect, &occupants);
 
-    // A region must fit the widget AND its trigger button at minimum segment
-    // width to be considered.
-    let min_footprint_w = total_footprint_width(MIN_SEGMENT_W);
+    // A region must fit at least the compact widget form to be considered.
+    let min_footprint_w = min_widget_footprint();
 
     // Prefer the region the widget currently sits in; if that region no
     // longer fits the widget (e.g., a new pinned app squeezed it), fall back
@@ -1943,11 +2389,11 @@ fn auto_resize_to_current_region() {
     }
     let dpi = CURRENT_DPI.load(Ordering::Relaxed).max(1) as i32;
     let region_w_design = region_w_physical * 96 / dpi;
-    let usable_design = region_w_design - action_window::TRIGGER_SIZE - action_window::TRIGGER_GAP;
-    let bars_design =
-        usable_design - FIXED_NON_BAR_DESIGN_WIDTH - (SEGMENT_COUNT - 1) * SEGMENT_GAP;
-    let new_seg = (bars_design / SEGMENT_COUNT).clamp(MIN_SEGMENT_W, MAX_SEGMENT_W);
-    let new_widget_w = total_widget_width(new_seg);
+    let (new_tier, new_seg) = match layout_for_region_width(region_w_design) {
+        Some(v) => v,
+        None => return,
+    };
+    let new_widget_w = widget_width_for(new_tier, new_seg);
 
     let mut tray_left = taskbar_rect.right;
     if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
@@ -1961,7 +2407,8 @@ fn auto_resize_to_current_region() {
         let state = lock_state();
         state.as_ref().map(|s| s.tray_offset).unwrap_or(0)
     };
-    if new_seg == current_seg && new_offset == current_offset {
+    let seg_unchanged = !matches!(new_tier, LayoutTier::Bars) || new_seg == current_seg;
+    if new_tier == current_tier && seg_unchanged && new_offset == current_offset {
         return;
     }
 
@@ -1969,7 +2416,10 @@ fn auto_resize_to_current_region() {
     {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            s.segment_w_design = new_seg;
+            s.layout_tier = new_tier;
+            if matches!(new_tier, LayoutTier::Bars) {
+                s.segment_w_design = new_seg;
+            }
             s.tray_offset = new_offset;
         }
     }
@@ -2065,6 +2515,7 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_COUNTDOWN => {
                     update_display();
                     render_layered();
+                    update_widget_tooltip();
                     schedule_countdown_timer();
                 }
                 TIMER_RESET_POLL => {
@@ -2099,6 +2550,7 @@ unsafe extern "system" fn wnd_proc(
             schedule_countdown_timer();
             let (pct, tooltip) = tray_icon_data_from_state();
             tray_icon::update(hwnd, pct, &tooltip);
+            update_widget_tooltip();
             LRESULT(0)
         }
         WM_APP_UPDATE_CHECK_COMPLETE => {
@@ -2122,11 +2574,14 @@ unsafe extern "system" fn wnd_proc(
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let _ = ScreenToClient(hwnd, &mut pt);
-                if pt.x < sc(DIVIDER_HIT_ZONE) {
-                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
-                    SetCursor(cursor);
-                    return LRESULT(1);
-                }
+                let cursor_id = if pt.x < sc(DIVIDER_HIT_ZONE) {
+                    IDC_SIZEALL
+                } else {
+                    IDC_HAND
+                };
+                let cursor = LoadCursorW(HINSTANCE::default(), cursor_id).unwrap_or_default();
+                SetCursor(cursor);
+                return LRESULT(1);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -2154,16 +2609,7 @@ unsafe extern "system" fn wnd_proc(
                         // Combine fresh legacy HWND occupants with the cached
                         // UIA occupants (refreshed at startup and after each
                         // drag end).
-                        let trigger_hwnd = {
-                            let state = lock_state();
-                            state
-                                .as_ref()
-                                .and_then(|s| s.trigger_hwnd.map(|h| h.to_hwnd()))
-                        };
-                        let exclude: Vec<HWND> = match trigger_hwnd {
-                            Some(t) => vec![hwnd, t],
-                            None => vec![hwnd],
-                        };
+                        let exclude: Vec<HWND> = vec![hwnd];
                         let mut occupants =
                             crate::highlight::compute_debug_rects(taskbar_hwnd, &exclude);
                         occupants.extend(crate::highlight::cached_uia_occupants());
@@ -2174,10 +2620,8 @@ unsafe extern "system" fn wnd_proc(
                         );
 
                         // A region is only a valid snap target if the widget
-                        // and its trigger button can fit inside it at the
-                        // minimum allowed segment width (5 design-px per
-                        // progress-bar rectangle).
-                        let min_footprint_w = total_footprint_width(MIN_SEGMENT_W);
+                        // can fit inside it in at least its compact form.
+                        let min_footprint_w = min_widget_footprint();
                         regions.retain(|r| (r.rect.right - r.rect.left) >= min_footprint_w);
 
                         let mut overlay_hwnds =
@@ -2244,9 +2688,8 @@ unsafe extern "system" fn wnd_proc(
                                     tray_left = tray_rect.left;
                                 }
                             }
-                            let widget_width = total_widget_width(s.segment_w_design);
-                            let footprint_width = total_footprint_width(s.segment_w_design);
-                            let max_offset = tray_left - taskbar_rect.left - footprint_width;
+                            let widget_width = widget_width_for(s.layout_tier, s.segment_w_design);
+                            let max_offset = tray_left - taskbar_rect.left - widget_width;
                             if new_offset > max_offset {
                                 new_offset = max_offset;
                             }
@@ -2258,14 +2701,11 @@ unsafe extern "system" fn wnd_proc(
                             let anchor_height = taskbar_height;
                             let widget_height = sc(WIDGET_HEIGHT);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-                            let trigger_extent =
-                                sc(action_window::TRIGGER_SIZE) + sc(action_window::TRIGGER_GAP);
                             let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - trigger_extent - new_offset
+                                tray_left - taskbar_rect.left - widget_width - new_offset
                             } else {
-                                tray_left - widget_width - trigger_extent - new_offset
+                                tray_left - widget_width - new_offset
                             };
-                            let trigger_hwnd = s.trigger_hwnd.map(|h| h.to_hwnd());
                             Some((
                                 hwnd_val,
                                 embedded,
@@ -2274,7 +2714,6 @@ unsafe extern "system" fn wnd_proc(
                                 taskbar_rect.top,
                                 widget_width,
                                 widget_height,
-                                trigger_hwnd,
                             ))
                         } else {
                             s.tray_offset = new_offset;
@@ -2294,7 +2733,6 @@ unsafe extern "system" fn wnd_proc(
                     taskbar_top,
                     widget_width,
                     widget_height,
-                    trigger_hwnd,
                 )) = move_target
                 {
                     if embedded {
@@ -2308,33 +2746,33 @@ unsafe extern "system" fn wnd_proc(
                     } else {
                         native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
                     }
-                    if let Some(trigger_hwnd) = trigger_hwnd {
-                        let trigger_size = sc(action_window::TRIGGER_SIZE);
-                        let trigger_gap = sc(action_window::TRIGGER_GAP);
-                        let trigger_y_screen = y + (widget_height - trigger_size) / 2;
-                        let trigger_x = x + widget_width + trigger_gap;
-                        if embedded {
-                            native_interop::move_window(
-                                trigger_hwnd,
-                                trigger_x,
-                                trigger_y_screen - taskbar_top,
-                                trigger_size,
-                                trigger_size,
-                            );
-                        } else {
-                            native_interop::move_window(
-                                trigger_hwnd,
-                                trigger_x,
-                                trigger_y_screen,
-                                trigger_size,
-                                trigger_size,
-                            );
-                        }
-                    }
                 }
 
                 update_hovered_region(pt.x);
+            } else {
+                // Arm hover + leave tracking so the tooltip shows up after
+                // the user lingers, and dismisses when the cursor leaves
+                // the widget. TrackMouseEvent rearms itself per call.
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_HOVER | TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: TOOLTIP_HOVER_MS,
+                };
+                let _ = TrackMouseEvent(&mut tme);
             }
+            LRESULT(0)
+        }
+        WM_MOUSEHOVER => {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let mut wrect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wrect);
+            show_tooltip_at(wrect.top, pt.x);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            hide_tooltip();
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -2393,15 +2831,21 @@ unsafe extern "system" fn wnd_proc(
                 // every WM_MOUSEMOVE.
 
                 save_state_settings();
-                // Refresh the UIA cache off the UI thread so the next drag
-                // sees current pinned/running app positions.
+                // Refresh both occupant caches off the UI thread so the next
+                // drag and the next layout tick see current pinned/running
+                // app positions.
                 if let Some(taskbar_hwnd) = taskbar_hwnd {
                     if let Some(taskbar_rect) =
                         native_interop::get_taskbar_rect(taskbar_hwnd)
                     {
                         crate::highlight::spawn_uia_scan(taskbar_hwnd, taskbar_rect);
                     }
+                    crate::highlight::spawn_hwnd_scan(taskbar_hwnd, hwnd);
                 }
+            } else {
+                // Press happened outside the divider hit zone (so no drag was
+                // initiated): treat it as a click on the widget body.
+                action_window::open_panel();
             }
             LRESULT(0)
         }
@@ -2551,18 +2995,12 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            let (hook, trigger_hwnd) = {
+            let hook = {
                 let state = lock_state();
-                match state.as_ref() {
-                    Some(s) => (s.win_event_hook, s.trigger_hwnd.map(|h| h.to_hwnd())),
-                    None => (None, None),
-                }
+                state.as_ref().and_then(|s| s.win_event_hook)
             };
             if let Some(h) = hook {
                 native_interop::unhook_win_event(h);
-            }
-            if let Some(t) = trigger_hwnd {
-                let _ = DestroyWindow(t);
             }
             tray_icon::remove(hwnd);
             PostQuitMessage(0);
@@ -2608,7 +3046,7 @@ fn show_context_menu(hwnd: HWND) {
 
         let menu = CreatePopupMenu().unwrap();
 
-        let open_str = native_interop::wide_str("Open");
+        let open_str = native_interop::wide_str("Open manager");
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -2784,7 +3222,16 @@ fn show_context_menu(hwnd: HWND) {
 
 /// Paint for non-embedded fallback (normal WM_PAINT path)
 fn paint(hdc: HDC, hwnd: HWND) {
-    let (is_dark, strings, session_pct, session_text, weekly_pct, weekly_text, segment_w_design) = {
+    let (
+        is_dark,
+        strings,
+        session_pct,
+        session_text,
+        weekly_pct,
+        weekly_text,
+        segment_w_design,
+        layout_tier,
+    ) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
@@ -2795,6 +3242,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.weekly_percent,
                 s.weekly_text.clone(),
                 s.segment_w_design,
+                s.layout_tier,
             ),
             None => return,
         }
@@ -2846,6 +3294,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             weekly_pct,
             &weekly_text,
             segment_w_design,
+            layout_tier,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);

@@ -2,10 +2,11 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 struct DiagnoseState {
     file: Mutex<File>,
+    started: Instant,
 }
 
 static DIAGNOSE_STATE: OnceLock<DiagnoseState> = OnceLock::new();
@@ -21,6 +22,7 @@ pub fn init() -> Result<PathBuf, String> {
 
     let _ = DIAGNOSE_STATE.set(DiagnoseState {
         file: Mutex::new(file),
+        started: Instant::now(),
     });
 
     log("diagnostic logging enabled");
@@ -36,13 +38,12 @@ pub fn log(message: impl AsRef<str>) {
         return;
     };
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+    // Milliseconds since process start — precise enough to see which Win32
+    // call is blocking when investigating a startup hang.
+    let elapsed_ms = state.started.elapsed().as_millis();
 
     if let Ok(mut file) = state.file.lock() {
-        let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
+        let _ = writeln!(file, "[+{elapsed_ms:>6}ms] {}", message.as_ref());
         let _ = file.flush();
     }
 }

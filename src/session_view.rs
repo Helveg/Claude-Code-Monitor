@@ -31,11 +31,17 @@ unsafe impl Send for SessionView {}
 unsafe impl Sync for SessionView {}
 
 impl SessionView {
-    pub fn new(host_hwnd: HWND, notify_msg: u32, name: impl Into<String>, cmd: impl Into<String>) -> Self {
+    pub fn new(
+        host_hwnd: HWND,
+        notify_msg: u32,
+        name: impl Into<String>,
+        cmd: impl Into<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             bounds: RECT::default(),
             name: name.into(),
-            terminal: TerminalView::new(host_hwnd, notify_msg, cmd),
+            terminal: TerminalView::new(host_hwnd, notify_msg, cmd, cwd),
         }
     }
 
@@ -45,6 +51,7 @@ impl SessionView {
         self.terminal.set_bounds(inner, dpi);
     }
 
+    #[allow(dead_code)]
     pub fn bounds(&self) -> RECT {
         self.bounds
     }

@@ -22,6 +22,14 @@ static UIA_CACHE: Mutex<Vec<DebugRect>> = Mutex::new(Vec::new());
 /// no-op; the in-flight worker's results will land in the cache shortly.
 static UIA_SCAN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Cache of HWND-derived occupants. Populated by `spawn_hwnd_scan` on a
+/// worker thread so that `EnumWindows` + per-HWND cross-process queries
+/// (GetWindowRect, IsWindowVisible, GetClassName, FindWindowExW) never
+/// run on the UI thread, where they pile up SendMessage-style calls into
+/// explorer.exe and can stall the taskbar.
+static HWND_CACHE: Mutex<Vec<DebugRect>> = Mutex::new(Vec::new());
+static HWND_SCAN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 /// Set by `--debug-render` at startup. When true, drag-start additionally
 /// shows red-bordered overlays around every detected occupant with its
 /// class/name + dimensions, on top of the regular open-region highlights.
@@ -56,6 +64,34 @@ pub fn cached_uia_occupants() -> Vec<DebugRect> {
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default()
+}
+
+pub fn cached_hwnd_occupants() -> Vec<DebugRect> {
+    HWND_CACHE
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// Refresh the HWND occupant cache on a worker thread. Fire-and-forget —
+/// when it completes, `HWND_CACHE` holds the latest occupants for the next
+/// layout tick to consume. Mirrors `spawn_uia_scan`. Keeps `EnumWindows`
+/// and per-HWND cross-process queries off the UI thread.
+pub fn spawn_hwnd_scan(taskbar_hwnd: HWND, exclude_hwnd: HWND) {
+    if HWND_SCAN_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let taskbar_addr = taskbar_hwnd.0 as isize;
+    let exclude_addr = exclude_hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let taskbar_hwnd = HWND(taskbar_addr as *mut _);
+        let exclude_hwnd = HWND(exclude_addr as *mut _);
+        let occupants = compute_debug_rects(taskbar_hwnd, &[exclude_hwnd]);
+        if let Ok(mut cache) = HWND_CACHE.lock() {
+            *cache = occupants;
+        }
+        HWND_SCAN_IN_FLIGHT.store(false, Ordering::Release);
+    });
 }
 
 pub fn register_overlay_class(hinstance: HINSTANCE) {

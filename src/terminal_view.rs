@@ -30,18 +30,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use crate::native_interop::{self, Color};
 use crate::terminal::{Cell, Terminal};
 
-const FONT_POINT_SIZE: i32 = 11;
+pub const FONT_POINT_SIZE: i32 = 11;
 const TERMINAL_PADDING: i32 = 8;
 
 const CLAUDE_GREY_HEX: &str = "#262624";
 const DEFAULT_FG_HEX: &str = "#E8E8E8";
 
 #[derive(Clone, Copy, Debug)]
-struct Selection {
-    anchor_row: u16,
-    anchor_col: u16,
-    head_row: u16,
-    head_col: u16,
+pub struct Selection {
+    pub anchor_row: u16,
+    pub anchor_col: u16,
+    pub head_row: u16,
+    pub head_col: u16,
 }
 
 impl Selection {
@@ -62,6 +62,23 @@ impl Selection {
     }
 }
 
+/// Options passed to [`render_grid_region`] for partial / scaled grid renders
+/// (cards previews use this with a smaller font and a row tail).
+pub struct RenderOptions {
+    pub dpi: u32,
+    /// Font size in points. Lower values = smaller cells = more rows fit.
+    pub font_pt: i32,
+    /// Range of grid rows to draw, mapped to bounds top-down. Clamped to
+    /// what fits in `bounds` and to `grid.rows`.
+    pub rows: std::ops::Range<u16>,
+    /// Selection highlight to apply to matching cells (rows are in grid
+    /// coordinates, same as `rows`).
+    pub selection: Option<Selection>,
+    /// When true and the cursor's row is in the rendered range, draw the
+    /// inverted-cell cursor.
+    pub show_cursor: bool,
+}
+
 pub struct TerminalView {
     /// Pixel rect in the host window's client coords.
     bounds: RECT,
@@ -71,6 +88,7 @@ pub struct TerminalView {
     host_hwnd: HWND,
     notify_msg: u32,
     cmd: String,
+    cwd: Option<std::path::PathBuf>,
 }
 
 // HWND is the only !Send field; access is gated by the panel's mutex and the
@@ -82,7 +100,12 @@ impl TerminalView {
     /// Create the view. The PTY isn't spawned until `set_bounds` is called
     /// with a non-empty rect — the bounds determine cell metrics and grid
     /// dimensions.
-    pub fn new(host_hwnd: HWND, notify_msg: u32, cmd: impl Into<String>) -> Self {
+    pub fn new(
+        host_hwnd: HWND,
+        notify_msg: u32,
+        cmd: impl Into<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             bounds: RECT::default(),
             terminal: None,
@@ -91,6 +114,7 @@ impl TerminalView {
             host_hwnd,
             notify_msg,
             cmd: cmd.into(),
+            cwd,
         }
     }
 
@@ -108,7 +132,14 @@ impl TerminalView {
         };
         match &mut self.terminal {
             Some(t) => t.resize(cols, rows),
-            None => match Terminal::spawn(cols, rows, &self.cmd, self.host_hwnd, self.notify_msg) {
+            None => match Terminal::spawn(
+                cols,
+                rows,
+                &self.cmd,
+                self.cwd.as_deref(),
+                self.host_hwnd,
+                self.notify_msg,
+            ) {
                 Ok(t) => self.terminal = Some(t),
                 Err(err) => crate::diagnose::log(format!("terminal spawn failed: {err}")),
             },
@@ -132,37 +163,43 @@ impl TerminalView {
         }
     }
 
+    /// HWND that hosts this view — used by tiles that need to call the
+    /// `host_hwnd`-keyed APIs (font metrics, invalidate).
+    pub fn host_hwnd(&self) -> HWND {
+        self.host_hwnd
+    }
+
+    /// Clone of the terminal's `Arc<Mutex<Grid>>` for read-only access from
+    /// other tiles (e.g. the cards-grid live preview).
+    pub fn grid_arc(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::terminal::Grid>>> {
+        self.terminal.as_ref().map(|t| t.grid.clone())
+    }
+
+    pub fn last_output_ms(&self) -> u64 {
+        self.terminal.as_ref().map(|t| t.last_output_ms()).unwrap_or(0)
+    }
+
+    pub fn last_input_ms(&self) -> u64 {
+        self.terminal.as_ref().map(|t| t.last_input_ms()).unwrap_or(0)
+    }
+
     /// Paint into the host's HDC. The view paints inside its `bounds`.
     pub fn paint(&self, hdc: HDC, dpi: u32) {
         let area = self.term_area(dpi);
-        let main_font = unsafe { create_term_font(dpi) };
-        let symbol_font = unsafe { create_symbol_font(dpi) };
-        let old_font = unsafe { SelectObject(hdc, main_font) };
-        let (cell_w, cell_h) = unsafe { font_cell_metrics(self.host_hwnd, main_font) };
-        if cell_w <= 0 || cell_h <= 0 {
-            unsafe {
-                SelectObject(hdc, old_font);
-                let _ = DeleteObject(main_font);
-                let _ = DeleteObject(symbol_font);
-            }
-            return;
-        }
 
+        // Always paint the full panel bg first — even if the terminal hasn't
+        // spawned yet, we want a clean rect.
         let bg_default = ansi_default_bg();
-        let panel_bg_brush =
-            unsafe { CreateSolidBrush(COLORREF(bg_default.to_colorref())) };
         unsafe {
+            let panel_bg_brush = CreateSolidBrush(COLORREF(bg_default.to_colorref()));
             FillRect(hdc, &self.bounds, panel_bg_brush);
             let _ = DeleteObject(panel_bg_brush);
             let _ = SetBkMode(hdc, TRANSPARENT);
         }
 
         let Some(terminal) = self.terminal.as_ref() else {
-            unsafe {
-                SelectObject(hdc, old_font);
-                let _ = DeleteObject(main_font);
-                let _ = DeleteObject(symbol_font);
-            }
             return;
         };
         let grid_arc = terminal.grid.clone();
@@ -171,192 +208,19 @@ impl TerminalView {
             Err(p) => p.into_inner(),
         };
 
-        let area_w_cells = ((area.right - area.left) / cell_w).max(0) as u16;
-        let area_h_cells = ((area.bottom - area.top) / cell_h).max(0) as u16;
-        let visible_cols = grid.cols.min(area_w_cells);
-        let visible_rows = grid.rows.min(area_h_cells);
-
         let selection = self
             .selection
             .lock()
             .ok()
             .and_then(|g| *g);
-        let cell_render_colors = |cell: &Cell, row: u16, col: u16| -> (Color, Color) {
-            let (fg, bg) = cell_colors(cell);
-            if selection.map(|s| s.contains(row, col)).unwrap_or(false) {
-                (bg, fg)
-            } else {
-                (fg, bg)
-            }
+        let opts = RenderOptions {
+            dpi,
+            font_pt: FONT_POINT_SIZE,
+            rows: 0..grid.rows,
+            selection,
+            show_cursor: true,
         };
-
-        // Pre-compute glyph fallback decisions in one batched call.
-        let total_cells = visible_rows as usize * visible_cols as usize;
-        let mut row_chars: Vec<u16> = Vec::with_capacity(total_cells);
-        for row in 0..visible_rows {
-            for col in 0..visible_cols {
-                let cell = grid.cell(row, col);
-                let mut buf = [0u16; 2];
-                let s = cell.ch.encode_utf16(&mut buf);
-                row_chars.push(s[0]);
-            }
-        }
-        let mut glyph_indices = vec![0u16; total_cells];
-        if total_cells > 0 {
-            unsafe {
-                let _ = GetGlyphIndicesW(
-                    hdc,
-                    PCWSTR::from_raw(row_chars.as_ptr()),
-                    row_chars.len() as i32,
-                    glyph_indices.as_mut_ptr(),
-                    GGI_MARK_NONEXISTING_GLYPHS,
-                );
-            }
-        }
-        let needs_symbol = |row: u16, col: u16| -> bool {
-            let idx = row as usize * visible_cols as usize + col as usize;
-            glyph_indices.get(idx).copied().unwrap_or(0) == 0xFFFF
-        };
-
-        // Pass 1: backgrounds. Coalesce horizontal runs of identical bg.
-        for row in 0..visible_rows {
-            let y = area.top + row as i32 * cell_h;
-            let mut col = 0u16;
-            while col < visible_cols {
-                let cell = grid.cell(row, col);
-                let (_, bg) = cell_render_colors(&cell, row, col);
-                let mut run_end = col + 1;
-                while run_end < visible_cols {
-                    let next = grid.cell(row, run_end);
-                    let (_, next_bg) = cell_render_colors(&next, row, run_end);
-                    if next_bg.r != bg.r || next_bg.g != bg.g || next_bg.b != bg.b {
-                        break;
-                    }
-                    run_end += 1;
-                }
-                if bg.r != bg_default.r || bg.g != bg_default.g || bg.b != bg_default.b {
-                    let r = RECT {
-                        left: area.left + col as i32 * cell_w,
-                        top: y,
-                        right: area.left + run_end as i32 * cell_w,
-                        bottom: y + cell_h,
-                    };
-                    let brush = unsafe { CreateSolidBrush(COLORREF(bg.to_colorref())) };
-                    unsafe {
-                        FillRect(hdc, &r, brush);
-                        let _ = DeleteObject(brush);
-                    }
-                }
-                col = run_end;
-            }
-        }
-
-        // Pass 2: glyphs. Group runs by (fg color, font choice).
-        for row in 0..visible_rows {
-            let y = area.top + row as i32 * cell_h;
-            let mut col = 0u16;
-            while col < visible_cols {
-                let cell = grid.cell(row, col);
-                let (fg, _) = cell_render_colors(&cell, row, col);
-                let want_symbol = needs_symbol(row, col);
-                let mut text_buf: Vec<u16> = Vec::new();
-                let mut dx_buf: Vec<i32> = Vec::new();
-                let mut run_end = col;
-                while run_end < visible_cols {
-                    let c = grid.cell(row, run_end);
-                    let (next_fg, _) = cell_render_colors(&c, row, run_end);
-                    if next_fg.r != fg.r || next_fg.g != fg.g || next_fg.b != fg.b {
-                        break;
-                    }
-                    if needs_symbol(row, run_end) != want_symbol {
-                        break;
-                    }
-                    let mut buf = [0u16; 2];
-                    let s = c.ch.encode_utf16(&mut buf);
-                    let s_len = s.len();
-                    text_buf.extend_from_slice(s);
-                    for i in 0..s_len {
-                        dx_buf.push(if i + 1 == s_len { cell_w } else { 0 });
-                    }
-                    run_end += 1;
-                }
-                if !text_buf.is_empty() {
-                    unsafe {
-                        SelectObject(hdc, if want_symbol { symbol_font } else { main_font });
-                        let _ = SetTextColor(hdc, COLORREF(fg.to_colorref()));
-                    }
-                    let x = area.left + col as i32 * cell_w;
-                    unsafe {
-                        let _ = ExtTextOutW(
-                            hdc,
-                            x,
-                            y,
-                            ETO_OPTIONS(0),
-                            None,
-                            PCWSTR::from_raw(text_buf.as_ptr()),
-                            text_buf.len() as u32,
-                            Some(dx_buf.as_ptr()),
-                        );
-                    }
-                }
-                col = run_end;
-            }
-        }
-
-        // Cursor: invert the cell under the cursor.
-        if grid.cursor_visible
-            && grid.cursor_row < visible_rows
-            && grid.cursor_col < visible_cols
-        {
-            let cell = grid.cell(grid.cursor_row, grid.cursor_col);
-            let (fg, _bg) = cell_colors(&cell);
-            let r = RECT {
-                left: area.left + grid.cursor_col as i32 * cell_w,
-                top: area.top + grid.cursor_row as i32 * cell_h,
-                right: area.left + (grid.cursor_col as i32 + 1) * cell_w,
-                bottom: area.top + (grid.cursor_row as i32 + 1) * cell_h,
-            };
-            let brush = unsafe { CreateSolidBrush(COLORREF(fg.to_colorref())) };
-            unsafe {
-                FillRect(hdc, &r, brush);
-                let _ = DeleteObject(brush);
-            }
-            let bg_color = ansi_default_bg();
-            unsafe {
-                let _ = SetTextColor(hdc, COLORREF(bg_color.to_colorref()));
-            }
-            let mut buf = [0u16; 2];
-            let s = cell.ch.encode_utf16(&mut buf);
-            let cursor_font = if needs_symbol(grid.cursor_row, grid.cursor_col) {
-                symbol_font
-            } else {
-                main_font
-            };
-            unsafe {
-                SelectObject(hdc, cursor_font);
-            }
-            let dx: Vec<i32> = (0..s.len())
-                .map(|i| if i + 1 == s.len() { cell_w } else { 0 })
-                .collect();
-            unsafe {
-                let _ = ExtTextOutW(
-                    hdc,
-                    r.left,
-                    r.top,
-                    ETO_OPTIONS(0),
-                    None,
-                    PCWSTR::from_raw(s.as_ptr()),
-                    s.len() as u32,
-                    Some(dx.as_ptr()),
-                );
-            }
-        }
-
-        unsafe {
-            SelectObject(hdc, old_font);
-            let _ = DeleteObject(main_font);
-            let _ = DeleteObject(symbol_font);
-        }
+        render_grid_region(hdc, area, &grid, self.host_hwnd, &opts);
     }
 
     pub fn handle_mouse_down(&self, x: i32, y: i32) {
@@ -516,7 +380,7 @@ impl TerminalView {
     fn term_dimensions(&self, dpi: u32) -> Option<(u16, u16)> {
         unsafe {
             let area = self.term_area(dpi);
-            let font = create_term_font(dpi);
+            let font = create_term_font(dpi, FONT_POINT_SIZE);
             if font.is_invalid() {
                 return None;
             }
@@ -538,7 +402,7 @@ impl TerminalView {
             if !point_in(&area, x, y) {
                 return None;
             }
-            let font = create_term_font(dpi);
+            let font = create_term_font(dpi, FONT_POINT_SIZE);
             if font.is_invalid() {
                 return None;
             }
@@ -556,6 +420,226 @@ impl TerminalView {
 
 fn point_in(rect: &RECT, x: i32, y: i32) -> bool {
     x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+/// Render a slice of `grid` into `bounds` with the given font size + options.
+/// Used both by `TerminalView::paint` (full grid render) and by the live
+/// preview tiles (subset render at smaller font). Caller is responsible for
+/// painting the background of `bounds` before calling — this function only
+/// paints non-default cell backgrounds, glyphs, and (optionally) the cursor.
+pub fn render_grid_region(
+    hdc: HDC,
+    bounds: RECT,
+    grid: &crate::terminal::Grid,
+    host_hwnd: HWND,
+    opts: &RenderOptions,
+) {
+    let main_font = unsafe { create_term_font(opts.dpi, opts.font_pt) };
+    let symbol_font = unsafe { create_symbol_font(opts.dpi, opts.font_pt) };
+    let old_font = unsafe { SelectObject(hdc, main_font) };
+    let (cell_w, cell_h) = unsafe { font_cell_metrics(host_hwnd, main_font) };
+    if cell_w <= 0 || cell_h <= 0 {
+        unsafe {
+            SelectObject(hdc, old_font);
+            let _ = DeleteObject(main_font);
+            let _ = DeleteObject(symbol_font);
+        }
+        return;
+    }
+
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+    }
+
+    // Clamp the rendered rows to what the bounds can fit.
+    let bounds_rows = ((bounds.bottom - bounds.top) / cell_h).max(0) as u16;
+    let bounds_cols = ((bounds.right - bounds.left) / cell_w).max(0) as u16;
+    let row_start = opts.rows.start.min(grid.rows);
+    let row_end = opts.rows.end.min(grid.rows).min(row_start + bounds_rows);
+    let visible_cols = grid.cols.min(bounds_cols);
+
+    let bg_default = ansi_default_bg();
+    let selection = opts.selection;
+    let cell_render_colors = |cell: &Cell, row: u16, col: u16| -> (Color, Color) {
+        let (fg, bg) = cell_colors(cell);
+        if selection.map(|s| s.contains(row, col)).unwrap_or(false) {
+            (bg, fg)
+        } else {
+            (fg, bg)
+        }
+    };
+
+    // Pre-compute glyph fallback decisions for the rendered region in one
+    // batched GetGlyphIndicesW call.
+    let render_rows = row_end.saturating_sub(row_start);
+    let total_cells = render_rows as usize * visible_cols as usize;
+    let mut row_chars: Vec<u16> = Vec::with_capacity(total_cells);
+    for row in row_start..row_end {
+        for col in 0..visible_cols {
+            let cell = grid.cell(row, col);
+            let mut buf = [0u16; 2];
+            let s = cell.ch.encode_utf16(&mut buf);
+            row_chars.push(s[0]);
+        }
+    }
+    let mut glyph_indices = vec![0u16; total_cells];
+    if total_cells > 0 {
+        unsafe {
+            let _ = GetGlyphIndicesW(
+                hdc,
+                PCWSTR::from_raw(row_chars.as_ptr()),
+                row_chars.len() as i32,
+                glyph_indices.as_mut_ptr(),
+                GGI_MARK_NONEXISTING_GLYPHS,
+            );
+        }
+    }
+    let needs_symbol = |row: u16, col: u16| -> bool {
+        let i = (row - row_start) as usize * visible_cols as usize + col as usize;
+        glyph_indices.get(i).copied().unwrap_or(0) == 0xFFFF
+    };
+
+    let pixel_y = |row: u16| -> i32 { bounds.top + (row - row_start) as i32 * cell_h };
+
+    // Pass 1: backgrounds — coalesce horizontal runs.
+    for row in row_start..row_end {
+        let y = pixel_y(row);
+        let mut col = 0u16;
+        while col < visible_cols {
+            let cell = grid.cell(row, col);
+            let (_, bg) = cell_render_colors(&cell, row, col);
+            let mut run_end = col + 1;
+            while run_end < visible_cols {
+                let next = grid.cell(row, run_end);
+                let (_, next_bg) = cell_render_colors(&next, row, run_end);
+                if next_bg.r != bg.r || next_bg.g != bg.g || next_bg.b != bg.b {
+                    break;
+                }
+                run_end += 1;
+            }
+            if bg.r != bg_default.r || bg.g != bg_default.g || bg.b != bg_default.b {
+                let r = RECT {
+                    left: bounds.left + col as i32 * cell_w,
+                    top: y,
+                    right: bounds.left + run_end as i32 * cell_w,
+                    bottom: y + cell_h,
+                };
+                let brush = unsafe { CreateSolidBrush(COLORREF(bg.to_colorref())) };
+                unsafe {
+                    FillRect(hdc, &r, brush);
+                    let _ = DeleteObject(brush);
+                }
+            }
+            col = run_end;
+        }
+    }
+
+    // Pass 2: glyphs — group runs by (fg, font choice).
+    for row in row_start..row_end {
+        let y = pixel_y(row);
+        let mut col = 0u16;
+        while col < visible_cols {
+            let cell = grid.cell(row, col);
+            let (fg, _) = cell_render_colors(&cell, row, col);
+            let want_symbol = needs_symbol(row, col);
+            let mut text_buf: Vec<u16> = Vec::new();
+            let mut dx_buf: Vec<i32> = Vec::new();
+            let mut run_end = col;
+            while run_end < visible_cols {
+                let c = grid.cell(row, run_end);
+                let (next_fg, _) = cell_render_colors(&c, row, run_end);
+                if next_fg.r != fg.r || next_fg.g != fg.g || next_fg.b != fg.b {
+                    break;
+                }
+                if needs_symbol(row, run_end) != want_symbol {
+                    break;
+                }
+                let mut buf = [0u16; 2];
+                let s = c.ch.encode_utf16(&mut buf);
+                let s_len = s.len();
+                text_buf.extend_from_slice(s);
+                for i in 0..s_len {
+                    dx_buf.push(if i + 1 == s_len { cell_w } else { 0 });
+                }
+                run_end += 1;
+            }
+            if !text_buf.is_empty() {
+                unsafe {
+                    SelectObject(hdc, if want_symbol { symbol_font } else { main_font });
+                    let _ = SetTextColor(hdc, COLORREF(fg.to_colorref()));
+                }
+                let x = bounds.left + col as i32 * cell_w;
+                unsafe {
+                    let _ = ExtTextOutW(
+                        hdc,
+                        x,
+                        y,
+                        ETO_OPTIONS(0),
+                        None,
+                        PCWSTR::from_raw(text_buf.as_ptr()),
+                        text_buf.len() as u32,
+                        Some(dx_buf.as_ptr()),
+                    );
+                }
+            }
+            col = run_end;
+        }
+    }
+
+    // Cursor: invert the cell under the cursor if it's in the rendered range.
+    if opts.show_cursor
+        && grid.cursor_visible
+        && grid.cursor_row >= row_start
+        && grid.cursor_row < row_end
+        && grid.cursor_col < visible_cols
+    {
+        let cell = grid.cell(grid.cursor_row, grid.cursor_col);
+        let (fg, _bg) = cell_colors(&cell);
+        let y = pixel_y(grid.cursor_row);
+        let r = RECT {
+            left: bounds.left + grid.cursor_col as i32 * cell_w,
+            top: y,
+            right: bounds.left + (grid.cursor_col as i32 + 1) * cell_w,
+            bottom: y + cell_h,
+        };
+        let brush = unsafe { CreateSolidBrush(COLORREF(fg.to_colorref())) };
+        unsafe {
+            FillRect(hdc, &r, brush);
+            let _ = DeleteObject(brush);
+            let _ = SetTextColor(hdc, COLORREF(bg_default.to_colorref()));
+        }
+        let mut buf = [0u16; 2];
+        let s = cell.ch.encode_utf16(&mut buf);
+        let cursor_font = if needs_symbol(grid.cursor_row, grid.cursor_col) {
+            symbol_font
+        } else {
+            main_font
+        };
+        unsafe {
+            SelectObject(hdc, cursor_font);
+        }
+        let dx: Vec<i32> = (0..s.len())
+            .map(|i| if i + 1 == s.len() { cell_w } else { 0 })
+            .collect();
+        unsafe {
+            let _ = ExtTextOutW(
+                hdc,
+                r.left,
+                r.top,
+                ETO_OPTIONS(0),
+                None,
+                PCWSTR::from_raw(s.as_ptr()),
+                s.len() as u32,
+                Some(dx.as_ptr()),
+            );
+        }
+    }
+
+    unsafe {
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(main_font);
+        let _ = DeleteObject(symbol_font);
+    }
 }
 
 fn ansi_default_fg() -> Color {
@@ -590,8 +674,8 @@ fn cell_colors(cell: &Cell) -> (Color, Color) {
     }
 }
 
-unsafe fn create_term_font(dpi: u32) -> HFONT {
-    let height = -(FONT_POINT_SIZE * dpi as i32 / 72);
+unsafe fn create_term_font(dpi: u32, font_pt: i32) -> HFONT {
+    let height = -(font_pt * dpi as i32 / 72);
     let candidates = ["Cascadia Code", "Cascadia Mono", "Consolas", "Courier New"];
     for name in candidates {
         let face = native_interop::wide_str(name);
@@ -618,8 +702,8 @@ unsafe fn create_term_font(dpi: u32) -> HFONT {
     HFONT::default()
 }
 
-unsafe fn create_symbol_font(dpi: u32) -> HFONT {
-    let height = -(FONT_POINT_SIZE * dpi as i32 / 72);
+unsafe fn create_symbol_font(dpi: u32, font_pt: i32) -> HFONT {
+    let height = -(font_pt * dpi as i32 / 72);
     let face = native_interop::wide_str("Segoe UI Symbol");
     CreateFontW(
         height,

@@ -1,9 +1,16 @@
 #![windows_subsystem = "windows"]
 
 mod action_window;
+mod cards_tile;
+mod claude;
+mod claude_store;
+mod dashboard;
 mod diagnose;
 mod highlight;
+mod notifications_tile;
 mod session_view;
+mod sessions;
+mod sidebar_tile;
 mod terminal;
 mod terminal_view;
 mod localization;

@@ -5,7 +5,7 @@
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -87,7 +87,7 @@ fn palette_256(i: u8) -> (u8, u8, u8) {
     (scale(r), scale(g), scale(b))
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellAttrs {
     pub fg: Option<AnsiColor>,
     pub bg: Option<AnsiColor>,
@@ -102,7 +102,7 @@ impl CellAttrs {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
     pub attrs: CellAttrs,
@@ -145,6 +145,27 @@ pub struct Grid {
     /// one, the previous one is almost certainly a stale cursor visual the
     /// TUI forgot to clean up; we clear it ourselves.
     last_cursor_glyph_cell: Option<(u16, u16)>,
+    /// Set to true whenever any cell changes value. The worker thread reads
+    /// + clears this after each parse iteration to drive the per-session
+    /// "last meaningful output" timestamp — so cursor blinks / pings that
+    /// don't actually change the screen don't keep the status green.
+    content_dirty: bool,
+}
+
+/// Replace `cells[start..end]` with `blank`, returning whether any cell
+/// actually differed before the write. Used by erase / scroll operations
+/// to avoid spurious `content_dirty` bumps when the wiped region was
+/// already blank — that was making claude code's idle "redraw the input
+/// chrome every second" loop look like real activity.
+fn blank_range(cells: &mut [Cell], start: usize, end: usize, blank: Cell) -> bool {
+    let mut changed = false;
+    for c in &mut cells[start..end] {
+        if *c != blank {
+            *c = blank;
+            changed = true;
+        }
+    }
+    changed
 }
 
 impl Grid {
@@ -164,7 +185,16 @@ impl Grid {
             saved_cursor: None,
             pending_wrap: false,
             last_cursor_glyph_cell: None,
+            content_dirty: false,
         }
+    }
+
+    /// Read and clear the dirty flag. Called by the worker after each parse
+    /// iteration: returns true iff at least one cell value actually changed.
+    pub fn take_content_dirty(&mut self) -> bool {
+        let v = self.content_dirty;
+        self.content_dirty = false;
+        v
     }
 
     fn idx(&self, row: u16, col: u16) -> usize {
@@ -183,7 +213,10 @@ impl Grid {
             return;
         }
         let i = self.idx(row, col);
-        self.cells[i] = cell;
+        if self.cells[i] != cell {
+            self.cells[i] = cell;
+            self.content_dirty = true;
+        }
     }
 
     fn put_char(&mut self, ch: char) {
@@ -275,6 +308,7 @@ impl Grid {
         let n = (n as usize).min(bot - top + 1);
         let cols = self.cols as usize;
         let blank = self.blank_cell();
+        self.content_dirty = true;
         for row in top..=bot {
             let dst_start = row * cols;
             let dst_end = dst_start + cols;
@@ -299,6 +333,7 @@ impl Grid {
         let n = (n as usize).min(bot - top + 1);
         let cols = self.cols as usize;
         let blank = self.blank_cell();
+        self.content_dirty = true;
         for row in (top..=bot).rev() {
             let dst_start = row * cols;
             let dst_end = dst_start + cols;
@@ -326,28 +361,24 @@ impl Grid {
 
     fn erase_in_display(&mut self, mode: u16) {
         let blank = self.blank_cell();
+        let len = self.cells.len();
+        let mut changed = false;
         match mode {
             0 => {
-                // From cursor to end
                 let start = self.idx(self.cursor_row, self.cursor_col);
-                for c in &mut self.cells[start..] {
-                    *c = blank;
-                }
+                changed = blank_range(&mut self.cells, start, len, blank);
             }
             1 => {
-                // Beginning to cursor
-                let end = self.idx(self.cursor_row, self.cursor_col) + 1;
-                let end = end.min(self.cells.len());
-                for c in &mut self.cells[..end] {
-                    *c = blank;
-                }
+                let end = (self.idx(self.cursor_row, self.cursor_col) + 1).min(len);
+                changed = blank_range(&mut self.cells, 0, end, blank);
             }
             2 | 3 => {
-                for c in &mut self.cells[..] {
-                    *c = blank;
-                }
+                changed = blank_range(&mut self.cells, 0, len, blank);
             }
             _ => {}
+        }
+        if changed {
+            self.content_dirty = true;
         }
     }
 
@@ -357,24 +388,18 @@ impl Grid {
         let row_start = self.idx(row, 0);
         let row_end = row_start + self.cols as usize;
         let cur = self.idx(row, self.cursor_col);
+        let mut changed = false;
         match mode {
-            0 => {
-                for c in &mut self.cells[cur..row_end] {
-                    *c = blank;
-                }
-            }
+            0 => changed = blank_range(&mut self.cells, cur, row_end, blank),
             1 => {
                 let end = (cur + 1).min(row_end);
-                for c in &mut self.cells[row_start..end] {
-                    *c = blank;
-                }
+                changed = blank_range(&mut self.cells, row_start, end, blank);
             }
-            2 => {
-                for c in &mut self.cells[row_start..row_end] {
-                    *c = blank;
-                }
-            }
+            2 => changed = blank_range(&mut self.cells, row_start, row_end, blank),
             _ => {}
+        }
+        if changed {
+            self.content_dirty = true;
         }
     }
 
@@ -394,6 +419,7 @@ impl Grid {
         for c in &mut self.cells[(row_end - n)..row_end] {
             *c = blank;
         }
+        self.content_dirty = true;
     }
 
     /// DECECH: erase N characters at the cursor position with the cursor
@@ -413,8 +439,8 @@ impl Grid {
         let row_start = self.idx(row, 0);
         let cur = row_start + col as usize;
         let blank = self.blank_cell();
-        for c in &mut self.cells[cur..(cur + n)] {
-            *c = blank;
+        if blank_range(&mut self.cells, cur, cur + n, blank) {
+            self.content_dirty = true;
         }
     }
 
@@ -437,6 +463,7 @@ impl Grid {
         for c in &mut self.cells[cur..fill_end] {
             *c = blank;
         }
+        self.content_dirty = true;
     }
 
     fn insert_lines(&mut self, n: u16) {
@@ -1020,6 +1047,20 @@ pub struct Terminal {
     pub rows: u16,
     closed: Arc<AtomicBool>,
     paint_pending: Arc<AtomicBool>,
+    /// Wall-clock millis (since UNIX epoch) when the worker thread last
+    /// parsed output bytes. Compared against `last_input_ms` to drive the
+    /// per-session attention heuristic.
+    last_output_ms: Arc<AtomicU64>,
+    last_input_ms: Arc<AtomicU64>,
+}
+
+/// Wall-clock millis since the UNIX epoch — best-effort, returns 0 if the
+/// clock is broken (which it shouldn't be).
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Terminal {
@@ -1027,14 +1068,18 @@ impl Terminal {
         cols: u16,
         rows: u16,
         cmd: &str,
+        cwd: Option<&std::path::Path>,
         notify_hwnd: HWND,
         notify_msg: u32,
     ) -> Result<Self, String> {
-        let pty_inner = unsafe { spawn_pty(cols, rows, cmd)? };
+        let pty_inner = unsafe { spawn_pty(cols, rows, cmd, cwd)? };
         let grid = Arc::new(Mutex::new(Grid::new(cols, rows)));
         let pty = Arc::new(Mutex::new(Some(pty_inner)));
         let closed = Arc::new(AtomicBool::new(false));
         let paint_pending = Arc::new(AtomicBool::new(false));
+        let now = now_ms();
+        let last_output_ms = Arc::new(AtomicU64::new(now));
+        let last_input_ms = Arc::new(AtomicU64::new(now));
 
         let h_out_read_addr: isize = {
             let guard = pty.lock().map_err(|_| "pty mutex poisoned")?;
@@ -1044,6 +1089,7 @@ impl Terminal {
         let grid_for_thread = Arc::clone(&grid);
         let closed_for_thread = Arc::clone(&closed);
         let paint_pending_for_thread = Arc::clone(&paint_pending);
+        let last_output_for_thread = Arc::clone(&last_output_ms);
         let notify = notify_hwnd.0 as isize;
         thread::spawn(move || {
             let h = HANDLE(h_out_read_addr as *mut _);
@@ -1052,6 +1098,7 @@ impl Terminal {
                 grid_for_thread,
                 closed_for_thread,
                 paint_pending_for_thread,
+                last_output_for_thread,
                 notify,
                 notify_msg,
             );
@@ -1064,7 +1111,17 @@ impl Terminal {
             rows,
             closed,
             paint_pending,
+            last_output_ms,
+            last_input_ms,
         })
+    }
+
+    pub fn last_output_ms(&self) -> u64 {
+        self.last_output_ms.load(Ordering::Acquire)
+    }
+
+    pub fn last_input_ms(&self) -> u64 {
+        self.last_input_ms.load(Ordering::Acquire)
     }
 
     pub fn paint_pending(&self) -> &Arc<AtomicBool> {
@@ -1075,6 +1132,7 @@ impl Terminal {
         if data.is_empty() {
             return;
         }
+        self.last_input_ms.store(now_ms(), Ordering::Release);
         let h = {
             let guard = match self.pty.lock() {
                 Ok(g) => g,
@@ -1135,7 +1193,12 @@ impl Drop for Terminal {
     }
 }
 
-unsafe fn spawn_pty(cols: u16, rows: u16, cmd: &str) -> Result<PtyInner, String> {
+unsafe fn spawn_pty(
+    cols: u16,
+    rows: u16,
+    cmd: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<PtyInner, String> {
     let sa = SECURITY_ATTRIBUTES {
         nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
@@ -1219,6 +1282,16 @@ unsafe fn spawn_pty(cols: u16, rows: u16, cmd: &str) -> Result<PtyInner, String>
     si.lpAttributeList = attr_list;
 
     let mut cmd_wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+    let cwd_wide: Option<Vec<u16>> = cwd.map(|p| {
+        p.to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+    let cwd_ptr = match &cwd_wide {
+        Some(v) => PCWSTR::from_raw(v.as_ptr()),
+        None => PCWSTR::null(),
+    };
     let mut pi = PROCESS_INFORMATION::default();
 
     let ok = CreateProcessW(
@@ -1229,7 +1302,7 @@ unsafe fn spawn_pty(cols: u16, rows: u16, cmd: &str) -> Result<PtyInner, String>
         false,
         EXTENDED_STARTUPINFO_PRESENT,
         None,
-        PCWSTR::null(),
+        cwd_ptr,
         &si.StartupInfo,
         &mut pi,
     )
@@ -1258,6 +1331,7 @@ fn output_reader_loop(
     grid: Arc<Mutex<Grid>>,
     closed: Arc<AtomicBool>,
     paint_pending: Arc<AtomicBool>,
+    last_output_ms: Arc<AtomicU64>,
     notify_hwnd: isize,
     notify_msg: u32,
 ) {
@@ -1281,12 +1355,20 @@ fn output_reader_loop(
             diagnose::log("terminal: ReadFile returned 0 / err — exiting reader");
             return;
         }
-        {
+        let any_change = {
             let mut g = match grid.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             parser.feed(&mut g, &buf[..n as usize]);
+            g.take_content_dirty()
+        };
+        // Only count this as "real activity" if the grid contents actually
+        // changed. Cursor / SGR / mode pings that pass through the parser
+        // without modifying any cell shouldn't keep a session marked Working
+        // forever.
+        if any_change {
+            last_output_ms.store(now_ms(), Ordering::Release);
         }
         // Coalesce repaints: only post a fresh notification if the previous
         // one hasn't been consumed yet. The UI side clears the flag before
