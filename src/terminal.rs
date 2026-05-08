@@ -1019,6 +1019,16 @@ unsafe impl Sync for PtyInner {}
 
 impl Drop for PtyInner {
     fn drop(&mut self) {
+        // We deliberately do NOT TerminateProcess(h_process) here. The
+        // spawned process is our claude-shim, which has its own
+        // refcount-based lifecycle (terminal-attached + per-session
+        // pipe subscribers). Hard-killing it would defeat that — a
+        // session with external subscribers should survive when the
+        // manager panel closes. Closing the ConPTY hands the shim an
+        // EOF on stdin, which its `local_stdin_to_pty` thread treats
+        // as "my console went away" and propagates to the lifecycle
+        // watcher, which makes the right call (kill claude only if no
+        // subscribers are left).
         unsafe {
             if self.hpc.0 != 0 {
                 ClosePseudoConsole(self.hpc);
@@ -1030,7 +1040,6 @@ impl Drop for PtyInner {
                 let _ = CloseHandle(self.h_out_read);
             }
             if !self.h_process.is_invalid() {
-                let _ = TerminateProcess(self.h_process, 0);
                 let _ = CloseHandle(self.h_process);
             }
             if !self.h_thread.is_invalid() {

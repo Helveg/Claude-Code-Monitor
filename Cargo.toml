@@ -1,20 +1,20 @@
 [package]
-name = "claude-code-usage-monitor"
-version = "1.3.5"
+name = "claude-manager"
+version = "1.4.0"
 edition = "2021"
 license = "MIT"
-description = "Claude Code Usage Monitor"
-homepage = "https://codezeno.com.au"
-repository = "https://github.com/CodeZeno/Claude-Code-Usage-Monitor"
+description = "Claude Manager — multi-session dashboard, shim-based attach, and usage monitor for Claude Code. Forked from Claude Code Usage Monitor by Code Zeno."
+authors = ["Robin De Schepper <robin.deschepper93@gmail.com>"]
+default-run = "claude-manager"
 
 [package.metadata.winres]
-CompanyName = "Code Zeno Pty Ltd"
-ProductName = "Claude Code Usage Monitor"
-FileDescription = "Claude Code Usage Monitor"
-OriginalFilename = "claude-code-usage-monitor.exe"
-InternalName = "ClaudeCodeUsageMonitor"
-Comments = "https://codezeno.com.au"
-LegalCopyright = "Copyright (C) 2026 Code Zeno Pty Ltd"
+CompanyName = "Robin De Schepper"
+ProductName = "Claude Manager"
+FileDescription = "Claude Manager"
+OriginalFilename = "claude-manager.exe"
+InternalName = "ClaudeManager"
+Comments = "Forked from Claude Code Usage Monitor by Code Zeno"
+LegalCopyright = "Copyright (C) 2026 Robin De Schepper. Forked from Code Zeno Pty Ltd."
 
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }

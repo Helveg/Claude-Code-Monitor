@@ -198,28 +198,26 @@ enum CardEntry<'a> {
 /// when `include_orphans` is set, sorted newest-first.
 ///
 /// We deliberately do *not* exclude jsonls whose cwd matches a live PTY
-/// session — we can't reliably correlate a live PTY to a specific jsonl,
-/// and hiding a whole project's history just because the user opened a new
-/// session in the same directory was the wrong default.
+/// session — hiding a whole project's history just because the user opened
+/// a new session in the same directory was the wrong default.
 ///
-/// We *do* suppress orphans whose `session_id` matches a live session's
-/// `resumed_from_session_id`: when the user clicks an orphan to resume it,
-/// the jsonl behind that orphan is now backing the new live PTY, so
-/// showing both as separate cards would just be a duplicate.
+/// We *do* suppress orphans whose `session_id` matches any live session's
+/// pre-supplied UUID: every live session knows its own UUID (set at spawn
+/// via `--session-id` or copied from `--resume`), so once claude writes
+/// the jsonl, that file is backing the live PTY and showing both as
+/// separate cards would just be a duplicate.
 fn build_cards<'a>(sessions: &'a Sessions, include_orphans: bool) -> Vec<CardEntry<'a>> {
     let store = claude_store::global();
     let mut cards: Vec<CardEntry> = Vec::new();
-    let resumed: std::collections::HashSet<String> = sessions
-        .iter()
-        .filter_map(|s| s.resumed_from_session_id.clone())
-        .collect();
+    let live_ids: std::collections::HashSet<String> =
+        sessions.iter().map(|s| s.session_id.clone()).collect();
     for s in sessions.iter() {
         let history = s.cwd.as_deref().and_then(|c| store.latest_for_cwd(c));
         cards.push(CardEntry::Live { session: s, history });
     }
     if include_orphans {
         for record in store.snapshot() {
-            if !record.session_id.is_empty() && resumed.contains(&record.session_id) {
+            if !record.session_id.is_empty() && live_ids.contains(&record.session_id) {
                 continue;
             }
             cards.push(CardEntry::Orphan { record });

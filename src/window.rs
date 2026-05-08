@@ -192,7 +192,7 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
 fn settings_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(appdata)
-        .join("ClaudeCodeUsageMonitor")
+        .join("ClaudeManager")
         .join("settings.json")
 }
 
@@ -279,7 +279,7 @@ fn tray_icon_data_from_state() -> (Option<f64>, String) {
     let state = lock_state();
     match state.as_ref() {
         Some(s) if s.last_poll_ok => (Some(s.session_percent), widget_tooltip_text(s)),
-        _ => (None, "Claude Code Usage Monitor".to_string()),
+        _ => (None, "Claude Manager".to_string()),
     }
 }
 
@@ -289,7 +289,7 @@ fn tray_icon_data_from_state() -> (Option<f64>, String) {
 /// Chinese labels truncated in compact rendering are still legible).
 fn widget_tooltip_text(s: &AppState) -> String {
     if !s.last_poll_ok {
-        return "Claude Code Usage Monitor".to_string();
+        return "Claude Manager".to_string();
     }
     let strings = s.language.strings();
     format!(
@@ -304,7 +304,7 @@ fn widget_tooltip_text(s: &AppState) -> String {
 // the taskbar at startup. With our own popup we control z-order, owner
 // chain, and message routing — none of which touch explorer.exe.
 
-const TOOLTIP_CLASS: &str = "ClaudeCodeUsageMonitorTooltip";
+const TOOLTIP_CLASS: &str = "ClaudeManagerTooltip";
 const TOOLTIP_PADDING_X: i32 = 8;
 const TOOLTIP_PADDING_Y: i32 = 6;
 const TOOLTIP_HOVER_MS: u32 = 400;
@@ -913,7 +913,7 @@ fn begin_winget_update(hwnd: HWND) {
 }
 
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
+const STARTUP_REGISTRY_KEY: &str = "ClaudeManager";
 
 /// Returns true only if the startup registry value points to this executable.
 fn is_startup_enabled() -> bool {
@@ -1162,7 +1162,7 @@ pub fn run() {
     diagnose::log("window::run started");
 
     // Single-instance guard: silently exit if another instance is running
-    let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
+    let mutex_name = native_interop::wide_str("Global\\ClaudeManager");
     let _mutex = unsafe {
         let handle = CreateMutexW(None, false, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
@@ -1180,7 +1180,7 @@ pub fn run() {
         }
     };
 
-    let class_name = native_interop::wide_str("ClaudeCodeUsageMonitor");
+    let class_name = native_interop::wide_str("ClaudeManager");
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();

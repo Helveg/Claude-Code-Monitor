@@ -37,7 +37,7 @@ pub static DEBUG_RENDER_ENABLED: AtomicBool = AtomicBool::new(false);
 
 const DEBUG_BORDER_WIDTH: i32 = 2;
 
-const OVERLAY_CLASS: &str = "ClaudeCodeUsageMonitorHighlight";
+const OVERLAY_CLASS: &str = "ClaudeManagerHighlight";
 
 const FILL_ALPHA_DIM: u8 = 32;
 const BORDER_ALPHA_DIM: u8 = 110;

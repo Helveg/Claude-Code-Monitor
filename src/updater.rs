@@ -13,13 +13,18 @@ use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION: &str = "2022-11-28";
-const RELEASE_ASSET_NAME: &str = "claude-code-usage-monitor.exe";
+const RELEASE_ASSET_NAME: &str = "claude-manager.exe";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 // Keep this aligned with the package identifier used in winget-pkgs.
-const WINGET_PACKAGE_ID: &str = "CodeZeno.ClaudeCodeUsageMonitor";
+// Placeholder for the fork — until a winget package for "Claude Manager"
+// is actually published, "Update via WinGet" will fail gracefully (winget
+// returns "no package found"). Pointing this back at upstream
+// (`CodeZeno.ClaudeCodeUsageMonitor`) would silently overwrite the fork
+// binary with the upstream build, so we deliberately don't.
+const WINGET_PACKAGE_ID: &str = "RobinDeSchepper.ClaudeManager";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallChannel {
@@ -333,11 +338,11 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
 
 fn updates_dir() -> Result<PathBuf, String> {
     dirs::data_local_dir()
-        .map(|dir| dir.join("ClaudeCodeUsageMonitor").join("updates"))
+        .map(|dir| dir.join("ClaudeManager").join("updates"))
         .or_else(|| {
             Some(
                 std::env::temp_dir()
-                    .join("ClaudeCodeUsageMonitor")
+                    .join("ClaudeManager")
                     .join("updates"),
             )
         })

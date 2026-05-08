@@ -17,7 +17,7 @@ use crate::native_interop::{self, Color};
 use crate::session_view::SessionView;
 use crate::sessions::{SessionId, SessionStatus, Sessions};
 
-const PANEL_CLASS: &str = "ClaudeCodeUsageMonitorPanel";
+const PANEL_CLASS: &str = "ClaudeManagerPanel";
 
 const PANEL_W: i32 = 900;
 const PANEL_H: i32 = 600;
@@ -152,12 +152,17 @@ pub fn open_panel() {
 
         // Initial session: one "claude" session filling the panel area,
         // running the claude code CLI in the app's current working directory.
-        let claude_cmd = crate::claude::ClaudeArgs::default().build_command_line();
+        let session_id = crate::claude::new_session_id();
+        let claude_cmd = crate::claude::ClaudeArgs {
+            session_id: Some(session_id.clone()),
+            ..Default::default()
+        }
+        .build_command_line();
         let cwd = std::env::current_dir().ok();
         let session_view =
             SessionView::new(hwnd, WM_APP_TERM_OUTPUT, "claude", claude_cmd, cwd.clone());
         let mut sessions = Sessions::new();
-        let id = sessions.add("claude", session_view, cwd, None);
+        let id = sessions.add("claude", session_view, cwd, session_id);
 
         let view = PanelView::Dashboard { queue_mode: false };
 
@@ -238,11 +243,16 @@ impl Panel {
             dashboard::TileAction::CreateSession => {
                 let n = self.sessions.iter().count() + 1;
                 let name = format!("session {}", n);
-                let claude_cmd = crate::claude::ClaudeArgs::default().build_command_line();
+                let session_id = crate::claude::new_session_id();
+                let claude_cmd = crate::claude::ClaudeArgs {
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                }
+                .build_command_line();
                 let cwd = std::env::current_dir().ok();
                 let view =
                     SessionView::new(hwnd, WM_APP_TERM_OUTPUT, &name, claude_cmd, cwd.clone());
-                let id = self.sessions.add(name, view, cwd, None);
+                let id = self.sessions.add(name, view, cwd, session_id);
                 self.set_focused_session(Some(id));
                 self.recompute_layout(hwnd);
                 unsafe {
@@ -253,8 +263,8 @@ impl Panel {
                 // Resuming = spawn a new PTY running `claude --resume <id>`
                 // in the orphan jsonl's project cwd. claude wires the
                 // stored history into the new conversation. We tag the
-                // live session with the original session id so the orphan
-                // card backing that jsonl is suppressed from the grid.
+                // live session with the same id so the orphan card backing
+                // that jsonl is suppressed from the grid.
                 let claude_cmd = crate::claude::ClaudeArgs {
                     resume: Some(session_id.clone()),
                     ..Default::default()
@@ -267,7 +277,7 @@ impl Panel {
                     claude_cmd,
                     Some(cwd.clone()),
                 );
-                let id = self.sessions.add(name, view, Some(cwd), Some(session_id));
+                let id = self.sessions.add(name, view, Some(cwd), session_id);
                 self.set_focused_session(Some(id));
                 self.recompute_layout(hwnd);
                 unsafe {
@@ -360,16 +370,12 @@ impl Panel {
                 .grid_arc()
                 .map(|g| g.lock().unwrap_or_else(|p| p.into_inner()).cursor_visible)
                 .unwrap_or(true);
-            // Cross-contamination guard: only feed jsonl signals to a live
-            // PTY when we know the specific session UUID it belongs to
-            // (i.e. it was launched via `claude --resume <id>`). For
-            // freshly-spawned sessions we don't know which jsonl is theirs,
-            // and the newest jsonl in the cwd may belong to a totally
-            // different running claude process.
-            let history = session
-                .resumed_from_session_id
-                .as_deref()
-                .and_then(|id| store.lookup_by_session_id(id));
+            // We always know the session's UUID (set at spawn via
+            // `--session-id` or copied from `--resume`), so we can look up
+            // the matching jsonl directly. Returns None until claude has
+            // written the file (which only happens on the first user
+            // message — startup alone doesn't create it).
+            let history = store.lookup_by_session_id(&session.session_id);
             let jsonl_mtime_ms = history.as_ref().and_then(|h| {
                 h.last_modified
                     .duration_since(std::time::UNIX_EPOCH)

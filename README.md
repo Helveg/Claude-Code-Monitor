@@ -1,145 +1,133 @@
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-# Claude Code Usage Monitor
+# Claude Manager
+
+> **Forked from [Claude Code Usage Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) by Code Zeno Pty Ltd.** This fork keeps the original taskbar usage widget and adds a multi-session dashboard, plus a transparent shim around `claude.exe` that lets multiple terminals (and the manager itself) attach to a single live Claude Code session — like `tmux attach`, but for `claude`.
 
 ![Screenshot](.github/animation.gif)
 
-A lightweight Windows taskbar widget for people already using Claude Code.
+## What it does
 
-It sits in your taskbar and shows how much of your Claude Code usage window you have left, without needing to open the terminal or the Claude site.
+**Usage monitor (inherited from upstream):**
+- Taskbar widget showing your 5-hour and 7-day usage windows with live countdowns
+- System tray icon with a color-coded percentage badge
+- Right-click options for refresh frequency, language, "Start with Windows", updates
 
-## What You Get
-
-- A **5h** bar for your current 5-hour Claude usage window
-- A **7d** bar for your current 7-day window
-- A live countdown until each limit resets
-- A small native widget that lives directly in the Windows taskbar
-- A **system tray icon** showing your usage percentage as a color-coded badge
-- Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, update frequency, language, startup, and updates
-
-## Who This Is For
-
-This app is for Windows users who already have **Claude Code (CLI or App) installed and signed in**.
-
-It works best if you want a simple "how close am I to the limit?" display that is always visible.
+**Session manager (new in this fork):**
+- Dashboard listing every live `claude` session — terminal-launched OR manager-launched
+- **Attach from the dashboard** to any session running in any terminal; type and watch in either window with the changes mirrored
+- **`claude.exe` shim** transparently wraps the real claude. You don't change how you start sessions; the shim handles ownership, registry registration, and subscriber dispatch silently
+- **Refcount-based lifecycle**: closing your terminal doesn't kill an in-progress claude as long as the manager (or another terminal) is still attached. Last subscriber leaves → claude exits cleanly
+- **Manager rediscovers sessions on restart** by walking `\\.\pipe\ccmonitor-session-*` — close and reopen the manager without losing track of what's running
 
 ## Requirements
 
 - Windows 10 or Windows 11
 - Claude Code (CLI or App) installed and authenticated
 
-If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
-
 ## Install
 
-Install the latest version from WinGet:
+Download the latest `claude-manager-<version>-x86_64.msi` from the [Releases page](https://github.com/Helveg/Claude-Code-Monitor/releases) and run it. The installer:
 
+- Places `claude-manager.exe` and `claude.exe` (the shim) in `Program Files\claude-manager\bin`
+- Prepends that directory to system PATH so `claude` from any new shell goes through the shim
+- Adds a "Claude Code Monitor" Start Menu shortcut
+- Registers in Add/Remove Programs (uninstall reverses everything)
+
+The original non-fork version is still available via WinGet:
 ```powershell
 winget install CodeZeno.ClaudeCodeUsageMonitor
 ```
 
-If you prefer not to use WinGet, you can still download the latest `claude-code-usage-monitor.exe` from the [Releases](https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases) page and run it directly.
+## Usage
 
-## Use
-
-After installing with WinGet, run:
+After install, open a new shell so the updated PATH is in effect, then:
 
 ```powershell
-claude-code-usage-monitor
+claude            # transparently goes through the shim
 ```
 
-Once running, it will appear in your taskbar and as a tray icon in the notification area.
+The first invocation generates a session UUID, registers with the manager (best-effort), and spawns real claude inside a ConPTY. The shim is invisible — claude works exactly as before.
 
-- Drag the left divider to move the taskbar widget
-- Right-click the taskbar widget or tray icon for refresh, update frequency, Start with Windows, reset position, language, updates, and exit
-- Left-click the tray icon to toggle the taskbar widget on or off
-- Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
+To attach a second window to the same session:
 
-### System Tray Icon
+```powershell
+claude --resume <uuid>
+```
 
-The tray icon shows your current 5-hour usage as a color-coded percentage badge.
+Both windows mirror the same conversation. Type in either; both update.
 
-Hovering over the tray icon shows a tooltip with both your 5h and 7d usage.
+The manager (Start Menu → "Claude Code Monitor") shows every live session in its dashboard. Click a card to open it as another subscriber on the same session.
+
+## Architecture, briefly
+
+```
+Terminal A  ─── stdin/stdout ───┐
+                                ├── claude.exe (shim, OWNER)
+                                │      └── real claude (in ConPTY)
+                                │      └── \\.\pipe\ccmonitor-session-<uuid>
+                                │              ▲           ▲
+Terminal B (claude --resume) ───┘              │           │
+                                               │           │
+                              Manager dashboard  ──────────┘
+                              (subscribes via the same pipe)
+```
+
+- **Owner shim**: spawns real claude in a ConPTY, fans output to its local terminal + every connected subscriber, merges keystrokes from all subscribers into claude's stdin, manages min-of-all-clients resize.
+- **Subscriber shim**: when `claude --resume <uuid>` finds the per-session pipe already open, it skips spawning real claude and becomes a relay client. Its terminal mirrors owner output and forwards keystrokes upstream.
+- **Per-session pipe** (`\\.\pipe\ccmonitor-session-<uuid>`) carries length-prefixed framed bytes: `O`utput, `I`nput, `R`esize, `H`ello, `Q`uery, `M`etadata. Single-thread-per-pipe with `PeekNamedPipe` + non-blocking channel multiplexing — Windows synchronous-mode pipe I/O serializes per pipe, so naive multi-threading deadlocks.
+- **Registry pipe** (`\\.\pipe\ccmonitor-registry`) tracks live sessions for the dashboard; manager rediscovers by enumerating per-session pipes on startup.
+- **Refcount lifecycle**: `(terminal_alive ? 1 : 0) + subscribers.len()`. Hit zero → terminate claude.
+
+## Build from source
+
+Requires the Rust toolchain (`rustup`) and, for the MSI, [WiX Toolset 3.14](https://github.com/wixtoolset/wix3/releases) — the portable binaries zip works (no admin install needed).
+
+```powershell
+git clone https://github.com/Helveg/Claude-Code-Monitor
+cd Claude-Code-Monitor
+
+# Just the binaries
+cargo build --release
+# → target\release\claude-manager.exe
+# → target\release\claude.exe (shim)
+
+# Full MSI installer
+cargo install cargo-wix --locked
+cargo wix
+# → target\wix\claude-manager-<version>-x86_64.msi
+```
+
+Run the test suite:
+```powershell
+cargo test --lib
+```
 
 ## Diagnostics
 
-If you need to troubleshoot startup or visibility issues, run:
-
+Manager:
 ```powershell
-claude-code-usage-monitor --diagnose
+claude-manager --diagnose
+# → %TEMP%\claude-manager.log
 ```
 
-This writes a log file to:
-
-```text
-%TEMP%\claude-code-usage-monitor.log
+Shim (always logs when set):
+```powershell
+$env:CCMONITOR_SHIM_LOG = "$env:TEMP\ccmonitor-shim.log"
+claude
 ```
 
-Settings are saved to:
+Settings live in `%APPDATA%\ClaudeManager\settings.json`. The session jsonls written by claude itself live in `%USERPROFILE%\.claude\projects\<encoded-cwd>\<session-id>.jsonl`.
 
-```text
-%APPDATA%\ClaudeCodeUsageMonitor\settings.json
-```
+## Privacy
 
-## Account Support
+Same posture as upstream: open source, no analytics, no third-party backend. The app reads your Claude Code credentials from `~/.claude/.credentials.json` (or your WSL equivalent), talks to Anthropic's endpoints to read usage, and optionally talks to GitHub for self-update checks. The shim does not read or transmit conversation content; it just routes bytes between processes locally.
 
-This app works with the same account types that Claude Code itself supports.
+## Credits
 
-As of **March 19, 2026**, Anthropic's Claude Code setup documentation says:
+The taskbar widget, tray icon, usage polling, and overall app shell are from **[Claude Code Usage Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)** by Code Zeno Pty Ltd. The session manager / shim architecture in this fork is additive — none of upstream's behavior is removed.
 
-- **Supported:** Pro, Max, Teams, Enterprise, and Console accounts
-- **Not supported:** the free Claude.ai plan
+## License
 
-If Anthropic changes Claude Code availability in the future, this app should follow whatever Claude Code supports, as long as the usage data remains exposed through the same authenticated endpoints.
-
-## Privacy And Security
-
-This project is **open source**, so you can inspect exactly what it does.
-
-What the app reads:
-
-- Your local Claude Code OAuth credentials from `~/.claude/.credentials.json`
-- If needed, the same credentials file inside an installed WSL distro
-
-What the app sends over the network:
-
-- Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
-- Requests to GitHub only if you use the app's update check / self-update feature
-
-What the app stores locally:
-
-- Widget position
-- Polling frequency
-- Language preference
-- Last update check time
-
-What it does **not** do:
-
-- It does not send your credentials to any other server
-- It does not use a separate backend service
-- It does not collect analytics or telemetry
-- It does not upload your project files
-
-Notes:
-
-- If your Claude Code token is expired, the app may ask the local Claude CLI to refresh it in the background
-- Portable installs can update themselves by downloading the latest release from this repository
-
-## How It Works
-
-The monitor:
-
-1. Finds your Claude Code login credentials
-2. Reads your current usage from Anthropic
-3. Shows the result directly in the Windows taskbar
-4. Refreshes periodically in the background
-
-If the newer usage endpoint is unavailable, it can fall back to reading the rate-limit headers returned by Claude's Messages API.
-
-## Open Source
-
-This project is licensed under MIT.
-
-If you want to inspect the behavior or audit the code, everything is in this repository.
+MIT.

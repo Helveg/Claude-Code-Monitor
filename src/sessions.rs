@@ -152,10 +152,12 @@ pub struct Session {
     /// alongside `last_input_ms` so a session that finished output and the
     /// user has now looked at doesn't keep re-flagging as NeedsAttention.
     pub last_acknowledged_ms: u64,
-    /// claude session UUID this PTY was spawned to resume (`claude --resume`).
-    /// Used to dedupe the originating orphan card off the grid so a
-    /// resumed conversation doesn't show twice.
-    pub resumed_from_session_id: Option<String>,
+    /// claude session UUID this PTY is running. Set at spawn time via
+    /// `--session-id <uuid>` for fresh sessions, or copied from
+    /// `--resume <id>` for resumed ones — always populated. Used both to
+    /// look up the matching jsonl record (`claude_store::lookup_by_session_id`)
+    /// and to dedupe the orphan card backing the same id off the grid.
+    pub session_id: String,
     /// Short human-facing label from [`predict_status`] (`thinking`,
     /// `assistant`, `idle`, …). Rendered as the card subtitle.
     pub status_label: String,
@@ -178,15 +180,15 @@ impl Sessions {
     /// (which spawned the PTY); we wrap it with the metadata fields and assign
     /// a fresh id. `cwd` is the working directory the PTY was spawned in —
     /// used to match against `~/.claude/projects/` records on the cards grid.
-    /// `resumed_from_session_id` is set when the PTY was launched with
-    /// `claude --resume <id>`, so the orphan card backing that id can be
-    /// hidden from the grid.
+    /// `session_id` is the claude UUID for this conversation: pre-generated
+    /// via `claude::new_session_id()` for fresh spawns, or the resumed id for
+    /// `--resume` paths.
     pub fn add(
         &mut self,
         name: impl Into<String>,
         session_view: SessionView,
         cwd: Option<PathBuf>,
-        resumed_from_session_id: Option<String>,
+        session_id: String,
     ) -> SessionId {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -202,7 +204,7 @@ impl Sessions {
             // Treat a freshly-spawned session as already acknowledged — it
             // hasn't said anything that warrants attention yet.
             last_acknowledged_ms: crate::terminal::now_ms(),
-            resumed_from_session_id,
+            session_id,
             status_label: String::new(),
         });
         id
