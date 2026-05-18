@@ -42,12 +42,19 @@ const STATUS_DOT_SIZE: i32 = 7;
 const STATUS_DOT_GAP: i32 = 8;
 const NAME_FONT_PT: i32 = 10;
 const BORDER_RADIUS: i32 = 8;
+/// Square edge of the type badge ('L' / 'R' / 'H') in design pixels.
+const TYPE_BADGE_SIZE: i32 = 14;
+const TYPE_BADGE_FONT_PT: i32 = 7;
 
 const PANEL_BG_HEX: &str = "#262624";
 const CARD_BG_HEX: &str = "#1F1F1D";
 const CARD_BG_FOCUSED_HEX: &str = "#2C2C29";
 const CARD_BG_ORPHAN_HEX: &str = "#1B1B19";
 const CARD_BORDER_HEX: &str = "#3A3A38";
+/// Subtle wash drawn behind the info region when hovered or while the
+/// card is in "details" mode — distinct enough to read as interactive
+/// without yanking the eye away from the rest of the card.
+const INFO_REGION_HIGHLIGHT_HEX: &str = "#34342F";
 const NAME_FG_HEX: &str = "#E8E8E8";
 const NAME_FG_ORPHAN_HEX: &str = "#A8A29E";
 const META_FG_HEX: &str = "#7C766F";
@@ -56,6 +63,15 @@ const STATUS_THINKING_HEX: &str = "#5BD16B";
 const STATUS_NEEDS_HEX: &str = "#E07A5F";
 const SCROLLBAR_TRACK_HEX: &str = "#1B1B19";
 const SCROLLBAR_THUMB_HEX: &str = "#3A3A38";
+/// Accent color used for the small "shimmed/attachable" icon next to the
+/// status dot. Same orange as the chrome buttons so the marker reads as
+/// "manager-aware".
+const ATTACH_ICON_HEX: &str = "#D97757";
+/// Type-badge background colors, by card kind. The matching letter is
+/// drawn in `CARD_BG_HEX` for high contrast against any of these.
+const TYPE_BADGE_LIVE_HEX: &str = "#5BD16B";
+const TYPE_BADGE_REMOTE_HEX: &str = "#D97757";
+const TYPE_BADGE_ORPHAN_HEX: &str = "#7C766F";
 
 const META_FONT_PT: i32 = 8;
 
@@ -119,6 +135,38 @@ fn compute_grid_layout(bounds: &RECT, dpi: u32, card_count: usize) -> GridLayout
     }
 }
 
+/// Rect of the "info region" inside a card — the header strip that
+/// covers the type badge, status dot, attach icon, and name. Hovering
+/// it shows the help cursor; clicking toggles the card's details body.
+fn info_region(card: &RECT, dpi: u32, scale: f64, has_msgs_badge: bool) -> RECT {
+    // Mirrors the layout in `paint_card`: pad on the left, vertically
+    // centred on the name row. We exclude the right-side "N msgs"
+    // badge area so users can still right-click / drag past the badge
+    // without inadvertently triggering details.
+    let pad = (CARD_PADDING as f64 * scale).round() as i32;
+    let header_h = (HEADER_H as f64 * scale).round() as i32;
+    let subtitle_h = (SUBTITLE_H as f64 * scale).round() as i32;
+    let name_h = header_h - subtitle_h;
+    let top = card.top + pad / 2;
+    let dot_gap = (STATUS_DOT_GAP as f64 * scale).round() as i32;
+    // Conservative right edge — leave room for the optional "N msgs"
+    // badge by trimming a fixed amount when present. The exact pixel
+    // width of that badge depends on the font metrics, so we just
+    // back off by a comfortable few characters' worth.
+    let right_inset = if has_msgs_badge {
+        let _ = dpi;
+        pad + (dot_gap * 6)
+    } else {
+        pad
+    };
+    RECT {
+        left: card.left + pad / 2,
+        top,
+        right: (card.right - right_inset).max(card.left),
+        bottom: top + name_h,
+    }
+}
+
 /// Card rect at index `i` in the layout-virtual (pre-scroll) coordinate
 /// system: the tile's `inner` rect, with cards laid out top-down. The
 /// caller subtracts `scroll_y` from the `top`/`bottom` to get the actual
@@ -179,13 +227,46 @@ fn scrollbar_rects(
     Some((track, thumb))
 }
 
-/// One card in the grid. Live cards mirror a running session and may have
-/// a matching claude-store record (used to surface a message-count badge);
-/// orphan cards are read-only history entries — one per jsonl file under
-/// `~/.claude/projects/`.
+/// Stable identifier for a card across paints + hover/click events.
+/// Picked by source so a card's identity survives the registry / store
+/// reordering that happens between rebuilds. The variants line up with
+/// `CardEntry`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CardId {
+    Live(SessionId),
+    Remote(String),
+    Orphan(std::path::PathBuf),
+}
+
+impl CardId {
+    fn from_entry(entry: &CardEntry) -> Self {
+        match entry {
+            CardEntry::Live { session, .. } => CardId::Live(session.id),
+            CardEntry::Remote { session_id, .. } => CardId::Remote(session_id.clone()),
+            CardEntry::Orphan { record } => CardId::Orphan(record.jsonl_path.clone()),
+        }
+    }
+}
+
+/// One card in the grid. Three kinds:
+///
+///   * **Live** — backed by a panel-spawned `Session` with its own PTY.
+///     Renders a live mini-terminal preview; click focuses it.
+///   * **Remote** — a shim-registered claude running outside the manager
+///     (no local PTY yet). Renders the latest jsonl summary; click
+///     spawns a subscriber view to attach.
+///   * **Orphan** — a read-only history entry (one per jsonl under
+///     `~/.claude/projects/`). Click on a non-stale orphan with a known
+///     session id resumes the conversation in a fresh PTY.
 enum CardEntry<'a> {
     Live {
         session: &'a Session,
+        history: Option<ClaudeSession>,
+    },
+    Remote {
+        session_id: String,
+        cwd: std::path::PathBuf,
+        name: String,
         history: Option<ClaudeSession>,
     },
     Orphan {
@@ -193,37 +274,79 @@ enum CardEntry<'a> {
     },
 }
 
-/// Compute the ordered list of cards to render for the current view. Live
-/// sessions come first (in session-list order); orphan jsonls come after
-/// when `include_orphans` is set, sorted newest-first.
+/// Compute the ordered list of cards to render for the current view in
+/// three groups: live (panel-spawned) first, then remote (shim-registered
+/// outside the manager), then orphan jsonls (history) when
+/// `include_orphans` is set.
 ///
 /// We deliberately do *not* exclude jsonls whose cwd matches a live PTY
 /// session — hiding a whole project's history just because the user opened
 /// a new session in the same directory was the wrong default.
 ///
-/// We *do* suppress orphans whose `session_id` matches any live session's
-/// pre-supplied UUID: every live session knows its own UUID (set at spawn
-/// via `--session-id` or copied from `--resume`), so once claude writes
-/// the jsonl, that file is backing the live PTY and showing both as
-/// separate cards would just be a duplicate.
+/// We *do* suppress orphans whose `session_id` matches any live or
+/// remote session: an actively-running claude is a *running* session,
+/// not history, and shouldn't double up as both a card and an orphan.
 fn build_cards<'a>(sessions: &'a Sessions, include_orphans: bool) -> Vec<CardEntry<'a>> {
     let store = claude_store::global();
     let mut cards: Vec<CardEntry> = Vec::new();
-    let live_ids: std::collections::HashSet<String> =
+    let local_ids: std::collections::HashSet<String> =
         sessions.iter().map(|s| s.session_id.clone()).collect();
+
     for s in sessions.iter() {
         let history = s.cwd.as_deref().and_then(|c| store.latest_for_cwd(c));
         cards.push(CardEntry::Live { session: s, history });
     }
+
+    let mut remote_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in crate::registry::snapshot() {
+        if entry.session_id.is_empty() || local_ids.contains(&entry.session_id) {
+            continue;
+        }
+        let history = store.lookup_by_session_id(&entry.session_id);
+        let cwd_path = std::path::PathBuf::from(&entry.cwd);
+        let name = remote_card_title(&entry.session_id, &cwd_path);
+        remote_ids.insert(entry.session_id.clone());
+        cards.push(CardEntry::Remote {
+            session_id: entry.session_id,
+            cwd: cwd_path,
+            name,
+            history,
+        });
+    }
+
     if include_orphans {
         for record in store.snapshot() {
-            if !record.session_id.is_empty() && live_ids.contains(&record.session_id) {
+            if record.session_id.is_empty() {
+                cards.push(CardEntry::Orphan { record });
+                continue;
+            }
+            if local_ids.contains(&record.session_id) || remote_ids.contains(&record.session_id) {
                 continue;
             }
             cards.push(CardEntry::Orphan { record });
         }
     }
     cards
+}
+
+/// Card title for a remote (shim-registered) session: project basename
+/// + short session id, mirroring the orphan title format so the two
+/// groups read consistently.
+fn remote_card_title(session_id: &str, cwd: &std::path::Path) -> String {
+    let project = cwd
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let short_id: String = session_id.chars().take(8).collect();
+    if project.is_empty() && short_id.is_empty() {
+        "session".to_string()
+    } else if short_id.is_empty() {
+        project.to_string()
+    } else if project.is_empty() {
+        short_id
+    } else {
+        format!("{project} \u{00b7} {short_id}")
+    }
 }
 
 pub fn paint(
@@ -234,6 +357,8 @@ pub fn paint(
     focused: Option<SessionId>,
     include_orphans: bool,
     scroll_y: i32,
+    hovered_info: Option<&CardId>,
+    expanded_info: Option<&CardId>,
 ) {
     let panel_bg = Color::from_hex(PANEL_BG_HEX);
     unsafe {
@@ -266,6 +391,7 @@ pub fn paint(
 
     let name_font = create_font(NAME_FONT_PT, dpi, FW_MEDIUM.0 as i32);
     let meta_font = create_font(META_FONT_PT, dpi, FW_NORMAL.0 as i32);
+    let badge_font = create_font(TYPE_BADGE_FONT_PT, dpi, FW_BOLD.0 as i32);
 
     for (i, entry) in cards.iter().enumerate() {
         let virt = card_rect(&layout, i);
@@ -282,12 +408,29 @@ pub fn paint(
         if card.top >= layout.inner.bottom {
             break;
         }
-        paint_card(hdc, card, dpi, scale, radius, name_font, meta_font, focused, entry);
+        let id = CardId::from_entry(entry);
+        let is_hovered = hovered_info.map_or(false, |h| h == &id);
+        let is_expanded = expanded_info.map_or(false, |x| x == &id);
+        paint_card(
+            hdc,
+            card,
+            dpi,
+            scale,
+            radius,
+            name_font,
+            meta_font,
+            badge_font,
+            focused,
+            entry,
+            is_hovered,
+            is_expanded,
+        );
     }
 
     unsafe {
         let _ = DeleteObject(name_font);
         let _ = DeleteObject(meta_font);
+        let _ = DeleteObject(badge_font);
         let _ = RestoreDC(hdc, saved);
     }
 
@@ -308,6 +451,80 @@ fn paint_scrollbar(hdc: HDC, bounds: &RECT, layout: &GridLayout, dpi: u32, scrol
         FillRect(hdc, &thumb, thumb_brush);
         let _ = DeleteObject(thumb_brush);
     }
+}
+
+/// Draw the rounded type badge ('L' / 'R' / 'H') at `(x, y)` with edge
+/// `size`. Background is the type-coded color; the letter renders in
+/// the card-body color so contrast holds across all three palettes.
+/// Returns the pixel width consumed so the caller can advance its
+/// layout cursor.
+fn paint_type_badge(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    size: i32,
+    letter: char,
+    bg: Color,
+    fg: Color,
+    badge_font: HFONT,
+) -> i32 {
+    let radius = ((size as f64) * 0.30).round().max(2.0) as i32;
+    unsafe {
+        let brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
+        let rgn = CreateRoundRectRgn(x, y, x + size + 1, y + size + 1, radius * 2, radius * 2);
+        let _ = FillRgn(hdc, rgn, brush);
+        let _ = DeleteObject(rgn);
+        let _ = DeleteObject(brush);
+
+        let old_font = SelectObject(hdc, badge_font);
+        let _ = SetTextColor(hdc, COLORREF(fg.to_colorref()));
+        let mut buf: [u16; 1] = [letter as u16];
+        let mut rect = RECT {
+            left: x,
+            top: y,
+            right: x + size,
+            bottom: y + size,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut buf,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old_font);
+    }
+    size
+}
+
+/// Draw a tiny "attachable" link glyph at `(x, y)` with overall height
+/// `h` — two small rings connected by a horizontal bar. Returns the
+/// pixel width consumed so the caller can advance its layout cursor.
+/// Self-contained so we don't depend on the host having any particular
+/// font / icon set installed.
+fn paint_attach_icon(hdc: HDC, x: i32, y: i32, h: i32, color: Color) -> i32 {
+    let h = h.max(6);
+    let circle = h.max(4);
+    let bar = (h * 2 / 3).max(3);
+    let pen_w = ((h as f64 / 6.0).round() as i32).max(1);
+    let mid_y = y + h / 2;
+    unsafe {
+        let pen = CreatePen(PS_SOLID, pen_w, COLORREF(color.to_colorref()));
+        let old_pen = SelectObject(hdc, pen);
+        let null_brush = GetStockObject(NULL_BRUSH);
+        let old_brush = SelectObject(hdc, null_brush);
+
+        let lx = x;
+        let _ = Ellipse(hdc, lx, y, lx + circle, y + circle);
+        let rx = lx + circle + bar - pen_w;
+        let _ = Ellipse(hdc, rx, y, rx + circle, y + circle);
+        let _ = MoveToEx(hdc, lx + circle - pen_w, mid_y, None);
+        let _ = LineTo(hdc, rx + pen_w, mid_y);
+
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(pen);
+    }
+    (circle * 2 + bar - pen_w).max(1)
 }
 
 fn create_font(point_size: i32, dpi: u32, weight: i32) -> HFONT {
@@ -341,8 +558,11 @@ fn paint_card(
     radius: i32,
     name_font: HFONT,
     meta_font: HFONT,
+    badge_font: HFONT,
     focused: Option<SessionId>,
     entry: &CardEntry,
+    is_hovered_info: bool,
+    is_expanded_info: bool,
 ) {
     let header_h = (HEADER_H as f64 * scale).round() as i32;
     let subtitle_h = (SUBTITLE_H as f64 * scale).round() as i32;
@@ -350,6 +570,7 @@ fn paint_card(
     let pad = (CARD_PADDING as f64 * scale).round() as i32;
     let dot_size = (STATUS_DOT_SIZE as f64 * scale).round() as i32;
     let dot_gap = (STATUS_DOT_GAP as f64 * scale).round() as i32;
+    let badge_size = (TYPE_BADGE_SIZE as f64 * scale).round() as i32;
 
     let now = std::time::SystemTime::now();
     let is_focused = matches!(entry, CardEntry::Live { session, .. } if focused == Some(session.id));
@@ -403,16 +624,68 @@ fn paint_card(
         let _ = DeleteObject(pen);
     }
 
-    // Header strip: status dot + name on the top line, status label on
-    // the bottom line as a subtitle. Live and orphan cards both carry a
-    // dot — the live card's color comes from its computed `SessionStatus`,
-    // the orphan's from the jsonl's recency on disk. Stale orphans omit
-    // the dot entirely.
+    // Hover / expanded indicator: a soft wash behind the info region
+    // when the cursor is over it OR the card is currently in details
+    // mode. We draw it before the header glyphs so they sit on top.
+    let has_msgs_badge = matches!(
+        entry,
+        CardEntry::Live { history: Some(_), .. }
+            | CardEntry::Remote { history: Some(_), .. }
+            | CardEntry::Orphan { .. }
+    );
+    if is_hovered_info || is_expanded_info {
+        let region = info_region(&card, dpi, scale, has_msgs_badge);
+        let hl = Color::from_hex(INFO_REGION_HIGHLIGHT_HEX);
+        let inner_radius = (radius / 2).max(2);
+        unsafe {
+            let brush = CreateSolidBrush(COLORREF(hl.to_colorref()));
+            let rgn = CreateRoundRectRgn(
+                region.left,
+                region.top,
+                region.right + 1,
+                region.bottom + 1,
+                inner_radius * 2,
+                inner_radius * 2,
+            );
+            let _ = FillRgn(hdc, rgn, brush);
+            let _ = DeleteObject(rgn);
+            let _ = DeleteObject(brush);
+        }
+    }
+
+    // Header strip: type badge + status dot + (optional) attach icon +
+    // name on the top line, status label on the bottom line. Live and
+    // orphan cards both carry a status dot — the live card's color
+    // comes from its computed `SessionStatus`, the orphan's from the
+    // jsonl's recency on disk. Stale orphans omit the dot entirely.
     let header_top = card.top + pad / 2;
     let name_top = header_top;
     let name_bottom = name_top + name_h;
     let subtitle_top = name_bottom;
     let mut label_x = card.left + pad;
+
+    // Type badge — single-letter capsule indicating the card's nature.
+    // Sits left of the status dot so the user can read "what kind of
+    // session am I looking at" before any of the live state.
+    let (badge_letter, badge_bg) = match entry {
+        CardEntry::Live { .. } => ('L', Color::from_hex(TYPE_BADGE_LIVE_HEX)),
+        CardEntry::Remote { .. } => ('R', Color::from_hex(TYPE_BADGE_REMOTE_HEX)),
+        CardEntry::Orphan { .. } => ('H', Color::from_hex(TYPE_BADGE_ORPHAN_HEX)),
+    };
+    let badge_y = name_top + (name_h - badge_size) / 2;
+    let badge_letter_color = Color::from_hex(CARD_BG_HEX);
+    paint_type_badge(
+        hdc,
+        label_x,
+        badge_y,
+        badge_size,
+        badge_letter,
+        badge_bg,
+        badge_letter_color,
+        badge_font,
+    );
+    label_x += badge_size + (dot_gap / 2);
+
     let dot_y = name_top + (name_h - dot_size) / 2;
     let dot_color: Option<Color> = match entry {
         CardEntry::Live { session, .. } => Some(match session.status {
@@ -420,6 +693,19 @@ fn paint_card(
             SessionStatus::Thinking => Color::from_hex(STATUS_THINKING_HEX),
             SessionStatus::NeedsAttention => Color::from_hex(STATUS_NEEDS_HEX),
         }),
+        CardEntry::Remote { history, .. } => match history.as_ref().map(|h| h.activity_at(now)) {
+            Some(claude_store::SessionActivity::Thinking) => {
+                Some(Color::from_hex(STATUS_THINKING_HEX))
+            }
+            Some(claude_store::SessionActivity::NeedsAttention) => {
+                Some(Color::from_hex(STATUS_NEEDS_HEX))
+            }
+            // Remote sessions whose jsonl is `Stale` (or absent) are
+            // still alive in the registry — their PTY just hasn't
+            // written for a while. Show idle instead of nothing so the
+            // card still reads as a runnable session.
+            _ => Some(Color::from_hex(STATUS_IDLE_HEX)),
+        },
         CardEntry::Orphan { record } => match record.activity_at(now) {
             claude_store::SessionActivity::Thinking => {
                 Some(Color::from_hex(STATUS_THINKING_HEX))
@@ -449,6 +735,36 @@ fn paint_card(
         label_x += dot_size + dot_gap;
     }
 
+    // "Shimmed and attachable" indicator: a tiny link glyph next to the
+    // status dot. Drawn for live sessions whose PTY has registered with
+    // the shim's named-pipe registry, and for every remote card (which
+    // is by definition a registry entry — that's why it's a card).
+    // Absence on a live card means "this session can't be reached from
+    // another claude.exe yet" (registration in flight, or launched
+    // without our shim on PATH).
+    let is_attachable = match entry {
+        CardEntry::Live { session, .. } => {
+            !session.session_id.is_empty()
+                && crate::registry::lookup(&session.session_id).is_some()
+        }
+        CardEntry::Remote { .. } => true,
+        CardEntry::Orphan { .. } => false,
+    };
+    if is_attachable {
+        // Icon height is intentionally smaller than the status dot —
+        // the link is a secondary marker, not a peer.
+        let icon_h = ((dot_size as f64 * 0.75).round() as i32).max(5);
+        let icon_y = name_top + (name_h - icon_h) / 2;
+        let consumed = paint_attach_icon(
+            hdc,
+            label_x,
+            icon_y,
+            icon_h,
+            Color::from_hex(ATTACH_ICON_HEX),
+        );
+        label_x += consumed + (dot_gap / 2);
+    }
+
     let orphan_title;
     let (name_text, subtitle_text, history) = match entry {
         CardEntry::Live { session, history } => {
@@ -458,6 +774,25 @@ fn paint_card(
                 session.status_label.as_str()
             };
             (session.name.as_str(), label, history.as_ref())
+        }
+        CardEntry::Remote { name, history, .. } => {
+            // Pick a subtitle from the same activity buckets as orphans,
+            // falling back to "external" when the session has no jsonl
+            // yet — better than an empty subtitle.
+            let label = match history.as_ref().map(|h| h.activity_at(now)) {
+                Some(claude_store::SessionActivity::Thinking) => "thinking",
+                Some(claude_store::SessionActivity::NeedsAttention) => "assistant",
+                Some(claude_store::SessionActivity::Idle) | Some(claude_store::SessionActivity::Stale) => {
+                    match history.as_ref().map(|h| h.last_speaker) {
+                        Some(claude_store::LastSpeaker::Assistant) => "assistant",
+                        Some(claude_store::LastSpeaker::Human) => "human",
+                        Some(claude_store::LastSpeaker::ToolResult) => "tool",
+                        _ => "external",
+                    }
+                }
+                None => "external",
+            };
+            (name.as_str(), label, history.as_ref())
         }
         CardEntry::Orphan { record } => {
             orphan_title = orphan_card_title(record);
@@ -565,14 +900,147 @@ fn paint_card(
     if body.bottom <= body.top {
         return;
     }
-    match entry {
-        CardEntry::Live { session, .. } => {
-            paint_live_preview(hdc, body, dpi, session);
-        }
-        CardEntry::Orphan { record } => {
-            paint_orphan_body(hdc, body, record, meta_font);
+    if is_expanded_info {
+        paint_details_body(hdc, body, entry, meta_font);
+    } else {
+        match entry {
+            CardEntry::Live { session, .. } => {
+                paint_live_preview(hdc, body, dpi, session);
+            }
+            CardEntry::Remote { history, .. } => {
+                // No live PTY here, but the matching jsonl (if any)
+                // gives us a reasonable last-message summary — same
+                // body treatment as orphan cards.
+                if let Some(record) = history.as_ref() {
+                    paint_orphan_body(hdc, body, record, meta_font);
+                }
+            }
+            CardEntry::Orphan { record } => {
+                paint_orphan_body(hdc, body, record, meta_font);
+            }
         }
     }
+}
+
+/// Render the "details" view that replaces a card's body when the
+/// user has clicked its info region. A flat key/value list — id,
+/// type, attachable, last-message summary, etc. Sized in design
+/// pixels and clipped to `bounds`; lines that don't fit are dropped.
+fn paint_details_body(hdc: HDC, bounds: RECT, entry: &CardEntry, meta_font: HFONT) {
+    let lines = collect_detail_lines(entry);
+    let old_font = unsafe { SelectObject(hdc, meta_font) };
+    let mut tm = TEXTMETRICW::default();
+    unsafe {
+        let _ = GetTextMetricsW(hdc, &mut tm);
+    }
+    let line_h = (tm.tmHeight + 2).max(12);
+    let mut y = bounds.top;
+    let fg = Color::from_hex(META_FG_HEX);
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(fg.to_colorref()));
+    }
+    for (label, value) in lines {
+        if y + line_h > bounds.bottom {
+            break;
+        }
+        let text = format!("{label}: {value}");
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let mut rect = RECT {
+            left: bounds.left,
+            top: y,
+            right: bounds.right,
+            bottom: y + line_h,
+        };
+        unsafe {
+            let _ = DrawTextW(
+                hdc,
+                &mut wide,
+                &mut rect,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        }
+        y += line_h;
+    }
+    unsafe {
+        SelectObject(hdc, old_font);
+    }
+}
+
+/// Collect the key/value rows the details view should show for this
+/// card. Order matters — readers scan top-down looking for the most
+/// distinguishing fact first.
+fn collect_detail_lines(entry: &CardEntry) -> Vec<(&'static str, String)> {
+    let mut lines: Vec<(&'static str, String)> = Vec::new();
+    match entry {
+        CardEntry::Live { session, history } => {
+            lines.push(("Type", "Live (manager-spawned)".into()));
+            lines.push(("Name", session.name.clone()));
+            lines.push(("ID", short_session_id(&session.session_id)));
+            if let Some(cwd) = &session.cwd {
+                lines.push(("CWD", cwd.display().to_string()));
+            }
+            let status_label = if session.status_label.is_empty() {
+                "idle".into()
+            } else {
+                session.status_label.clone()
+            };
+            lines.push(("Status", status_label));
+            let attachable = !session.session_id.is_empty()
+                && crate::registry::lookup(&session.session_id).is_some();
+            lines.push((
+                "Attachable",
+                if attachable { "yes".into() } else { "no".into() },
+            ));
+            if let Some(record) = history.as_ref() {
+                lines.push(("Messages", record.message_count.to_string()));
+                if !record.last_message_summary.is_empty() {
+                    lines.push(("Last", record.last_message_summary.clone()));
+                }
+            }
+        }
+        CardEntry::Remote {
+            session_id,
+            cwd,
+            name,
+            history,
+        } => {
+            lines.push(("Type", "Remote (external shim)".into()));
+            lines.push(("Name", name.clone()));
+            lines.push(("ID", short_session_id(session_id)));
+            lines.push(("CWD", cwd.display().to_string()));
+            lines.push(("Attachable", "yes".into()));
+            if let Some(record) = history.as_ref() {
+                lines.push(("Messages", record.message_count.to_string()));
+                if !record.last_message_summary.is_empty() {
+                    lines.push(("Last", record.last_message_summary.clone()));
+                }
+            }
+        }
+        CardEntry::Orphan { record } => {
+            lines.push(("Type", "History (orphan jsonl)".into()));
+            lines.push(("ID", short_session_id(&record.session_id)));
+            lines.push(("CWD", record.project_path.display().to_string()));
+            lines.push(("Attachable", "no".into()));
+            lines.push(("Messages", record.message_count.to_string()));
+            if !record.last_message_summary.is_empty() {
+                lines.push(("Last", record.last_message_summary.clone()));
+            }
+        }
+    }
+    lines
+}
+
+/// Compress a session UUID to its `xxxxxxxx…yyyy` form so it fits on a
+/// single line of the details body without truncating the part the
+/// user usually cares about.
+fn short_session_id(id: &str) -> String {
+    if id.is_empty() {
+        return "(unknown)".into();
+    }
+    if id.len() <= 14 {
+        return id.to_string();
+    }
+    format!("{}\u{2026}{}", &id[..8], &id[id.len() - 4..])
 }
 
 /// Render the truncated last-message summary for an orphan session card.
@@ -829,9 +1297,11 @@ fn measure_preview_cell(host_hwnd: HWND, dpi: u32) -> (i32, i32) {
     unsafe { measure_preview_cell_inner(host_hwnd, dpi) }
 }
 
-/// Hand cursor over any clickable card (live, or an orphan with a known
-/// `session_id` that we can `claude --resume` against), or over the
-/// scrollbar thumb. Arrow elsewhere.
+/// Cursor selection on the cards grid:
+///   * scrollbar thumb → Hand
+///   * info region inside any card → Help
+///   * the rest of a clickable card → Hand
+///   * Arrow otherwise (including stale orphans with no session id).
 pub fn cursor_at(
     x: i32,
     y: i32,
@@ -852,6 +1322,7 @@ pub fn cursor_at(
     if !point_in(&layout.inner, x, y) {
         return CursorHint::Arrow;
     }
+    let scale = dpi as f64 / 96.0;
     for (i, entry) in cards.iter().enumerate() {
         let virt = card_rect(&layout, i);
         let card = RECT {
@@ -866,17 +1337,90 @@ pub fn cursor_at(
         if card.top >= layout.inner.bottom {
             break;
         }
-        if point_in(&card, x, y) {
-            return match entry {
-                CardEntry::Live { .. } => CursorHint::Hand,
-                CardEntry::Orphan { record } if !record.session_id.is_empty() => {
-                    CursorHint::Hand
-                }
-                CardEntry::Orphan { .. } => CursorHint::Arrow,
-            };
+        if !point_in(&card, x, y) {
+            continue;
         }
+        let has_msgs_badge = entry_has_msgs_badge(entry);
+        let info = info_region(&card, dpi, scale, has_msgs_badge);
+        if point_in(&info, x, y) {
+            return CursorHint::Help;
+        }
+        return match entry {
+            CardEntry::Live { .. } => CursorHint::Hand,
+            CardEntry::Remote { .. } => CursorHint::Hand,
+            CardEntry::Orphan { record } if !record.session_id.is_empty() => CursorHint::Hand,
+            CardEntry::Orphan { .. } => CursorHint::Arrow,
+        };
     }
     CursorHint::Arrow
+}
+
+/// Whether the right-side "N msgs" badge is rendered for this card —
+/// used by hit-testing to know whether to leave room on the right
+/// edge of the info region.
+fn entry_has_msgs_badge(entry: &CardEntry) -> bool {
+    match entry {
+        CardEntry::Live { history, .. } => history.is_some(),
+        CardEntry::Remote { history, .. } => history.is_some(),
+        CardEntry::Orphan { .. } => true,
+    }
+}
+
+/// Result of hit-testing a single point against the cards grid.
+/// `id` is whichever card the cursor sits inside (anywhere on it);
+/// `over_info` says whether that hit landed in the info region —
+/// the strip we wash on hover and toggle details on click.
+pub struct CardHit {
+    pub id: CardId,
+    pub over_info: bool,
+}
+
+/// Hit-test `(x, y)` against the cards grid and return the surrounding
+/// card (if any) plus whether the point sits in its info region.
+/// `WM_MOUSEMOVE` uses this both to drive the hover wash (info region
+/// only) and to auto-collapse the expanded details body when the
+/// cursor leaves the card entirely.
+pub fn card_hit_at(
+    x: i32,
+    y: i32,
+    bounds: RECT,
+    dpi: u32,
+    sessions: &Sessions,
+    include_orphans: bool,
+    scroll_y: i32,
+) -> Option<CardHit> {
+    let cards = build_cards(sessions, include_orphans);
+    let layout = compute_grid_layout(&bounds, dpi, cards.len());
+    let scroll_y = scroll_y.clamp(0, max_scroll(&layout));
+    if !point_in(&layout.inner, x, y) {
+        return None;
+    }
+    let scale = dpi as f64 / 96.0;
+    for (i, entry) in cards.iter().enumerate() {
+        let virt = card_rect(&layout, i);
+        let card = RECT {
+            left: virt.left,
+            top: virt.top - scroll_y,
+            right: virt.right,
+            bottom: virt.bottom - scroll_y,
+        };
+        if card.bottom < layout.inner.top {
+            continue;
+        }
+        if card.top >= layout.inner.bottom {
+            break;
+        }
+        if !point_in(&card, x, y) {
+            continue;
+        }
+        let has_msgs_badge = entry_has_msgs_badge(entry);
+        let info = info_region(&card, dpi, scale, has_msgs_badge);
+        return Some(CardHit {
+            id: CardId::from_entry(entry),
+            over_info: point_in(&info, x, y),
+        });
+    }
+    None
 }
 
 /// Outcome of clicking inside the cards tile. The panel layer interprets
@@ -944,6 +1488,7 @@ pub fn handle_lbutton_down_ex(
     if !point_in(&layout.inner, x, y) {
         return CardsClick::None;
     }
+    let scale = dpi as f64 / 96.0;
     for (i, entry) in cards.iter().enumerate() {
         let virt = card_rect(&layout, i);
         let card = RECT {
@@ -961,10 +1506,28 @@ pub fn handle_lbutton_down_ex(
         if !point_in(&card, x, y) {
             continue;
         }
+        // Info region click: toggle the details body. Takes precedence
+        // over the regular focus / attach / resume action so the user
+        // can inspect a card without committing to its primary action.
+        let has_msgs_badge = entry_has_msgs_badge(entry);
+        let info = info_region(&card, dpi, scale, has_msgs_badge);
+        if point_in(&info, x, y) {
+            return CardsClick::Card(TileAction::ToggleCardInfo(CardId::from_entry(entry)));
+        }
         return match entry {
             CardEntry::Live { session, .. } => {
                 CardsClick::Card(TileAction::FocusSession(session.id))
             }
+            CardEntry::Remote {
+                session_id,
+                cwd,
+                name,
+                ..
+            } => CardsClick::Card(TileAction::AttachSession {
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+                name: name.clone(),
+            }),
             CardEntry::Orphan { record } if !record.session_id.is_empty() => {
                 CardsClick::Card(TileAction::ResumeSession {
                     session_id: record.session_id.clone(),

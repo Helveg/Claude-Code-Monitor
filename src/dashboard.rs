@@ -60,6 +60,21 @@ pub enum TileAction {
         cwd: std::path::PathBuf,
         name: String,
     },
+    /// Attach to a live shim-owned session running outside the manager.
+    /// The panel spawns `<shim>.exe --session-id <id>` in a fresh PTY;
+    /// the shim auto-detects the existing per-session pipe and runs as
+    /// a subscriber, so the manager's terminal becomes a relay onto the
+    /// owner's I/O.
+    AttachSession {
+        session_id: String,
+        cwd: std::path::PathBuf,
+        name: String,
+    },
+    /// Toggle the "details" body for a given card on the cards grid —
+    /// when set, the card replaces its preview / summary with a list
+    /// of all known facts about the session (id, type, attachable, …).
+    /// A second click on the same info region collapses it.
+    ToggleCardInfo(crate::cards_tile::CardId),
 }
 
 /// Cursor a tile wants Windows to render at a given point. The panel maps
@@ -71,6 +86,10 @@ pub enum CursorHint {
     Arrow,
     IBeam,
     Hand,
+    /// "More info available here" — the system help/question cursor.
+    /// Used over the cards-grid info region to advertise that clicking
+    /// will reveal session details.
+    Help,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +257,9 @@ fn apply_bounds(tiles: &[(Tile, RECT)], dpi: u32, sessions: &mut Sessions) {
 
 impl Tile {
     /// Render this tile. Sessions are immutable here — `layout()` already
-    /// updated their bounds.
+    /// updated their bounds. `hovered_info` / `expanded_info` are
+    /// per-paint state from the panel, used only by the cards-grid
+    /// tile (every other tile ignores them).
     pub fn paint(
         &self,
         hdc: HDC,
@@ -246,6 +267,8 @@ impl Tile {
         dpi: u32,
         sessions: &Sessions,
         focused: Option<SessionId>,
+        hovered_info: Option<&cards_tile::CardId>,
+        expanded_info: Option<&cards_tile::CardId>,
     ) {
         match self {
             Tile::MainTerminal {
@@ -274,6 +297,8 @@ impl Tile {
                     focused,
                     *include_orphans,
                     *scroll_y,
+                    hovered_info,
+                    expanded_info,
                 );
             }
         }

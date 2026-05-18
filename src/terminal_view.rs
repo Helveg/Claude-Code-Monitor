@@ -190,7 +190,10 @@ impl TerminalView {
         let area = self.term_area(dpi);
 
         // Always paint the full panel bg first — even if the terminal hasn't
-        // spawned yet, we want a clean rect.
+        // spawned yet, we want a clean rect. This also wipes any letterbox
+        // region outside the canonical active grid (we deliberately don't
+        // render those cells below, so stale content from a previous larger
+        // canonical never leaks through).
         let bg_default = ansi_default_bg();
         unsafe {
             let panel_bg_brush = CreateSolidBrush(COLORREF(bg_default.to_colorref()));
@@ -208,6 +211,35 @@ impl TerminalView {
             Err(p) => p.into_inner(),
         };
 
+        // Constrain the rendered region to the canonical (post-merge) size
+        // when it's smaller than the local grid. The local grid keeps full
+        // dimensions because we don't resize it on every canonical update
+        // (the PTY does that authoritatively), so cells beyond the active
+        // region may hold stale content from before another subscriber
+        // joined. Clipping render bounds + the rows range avoids painting
+        // them — combined with the bg FillRect above, the letterbox shows
+        // as clean panel bg.
+        let (active_cols, active_rows) = match grid.canonical {
+            Some((c, r, _)) => (c.min(grid.cols), r.min(grid.rows)),
+            None => (grid.cols, grid.rows),
+        };
+        let (cell_w, cell_h) = unsafe {
+            let font = create_term_font(dpi, FONT_POINT_SIZE);
+            let m = font_cell_metrics(self.host_hwnd, font);
+            let _ = DeleteObject(font);
+            m
+        };
+        let active_area = if cell_w > 0 && cell_h > 0 {
+            RECT {
+                left: area.left,
+                top: area.top,
+                right: area.left + active_cols as i32 * cell_w,
+                bottom: area.top + active_rows as i32 * cell_h,
+            }
+        } else {
+            area
+        };
+
         let selection = self
             .selection
             .lock()
@@ -216,11 +248,12 @@ impl TerminalView {
         let opts = RenderOptions {
             dpi,
             font_pt: FONT_POINT_SIZE,
-            rows: 0..grid.rows,
+            rows: 0..active_rows,
             selection,
             show_cursor: true,
         };
-        render_grid_region(hdc, area, &grid, self.host_hwnd, &opts);
+        render_grid_region(hdc, active_area, &grid, self.host_hwnd, &opts);
+        draw_canonical_letterbox(hdc, area, active_area, &grid, dpi);
     }
 
     pub fn handle_mouse_down(&self, x: i32, y: i32) {
@@ -639,6 +672,119 @@ pub fn render_grid_region(
         SelectObject(hdc, old_font);
         let _ = DeleteObject(main_font);
         let _ = DeleteObject(symbol_font);
+    }
+}
+
+/// Draw the letterbox frame + label on top of the main grid render. When
+/// another subscriber to this session is attached at a smaller terminal
+/// size, the owner shrinks its PTY to that smallest size (tmux's
+/// smallest-wins rule); the local view stops rendering grid cells past
+/// the canonical region (paint() clipped them), so this function's only
+/// job is to outline the active region with a full 4-sided frame and
+/// label the constraint so the user knows why their content stops where
+/// it does.
+///
+/// `area` is the full terminal drawing area (padded), `active_area` is
+/// the canonical region the grid actually rendered into. When they match
+/// (we're the smallest viewer, or no other subscribers), the frame is
+/// skipped entirely.
+fn draw_canonical_letterbox(
+    hdc: HDC,
+    area: RECT,
+    active_area: RECT,
+    grid: &crate::terminal::Grid,
+    dpi: u32,
+) {
+    let Some((c_cols, c_rows, count)) = grid.canonical else {
+        return;
+    };
+    // Only draw on terminals that actually have extra cell rows/cols
+    // beyond the canonical region. Comparing pixel rects would draw the
+    // frame on a terminal whose grid matches canonical exactly but whose
+    // padded area is a couple of sub-cell pixels wider — making the
+    // smallest viewer (which dictates canonical) wrongly render a frame.
+    if c_cols >= grid.cols && c_rows >= grid.rows {
+        return;
+    }
+
+    // Muted stroke that reads as chrome, not content. Slightly above
+    // the panel bg's value so it's discernible without competing with
+    // any TUI output near the edge.
+    let stroke = Color::new(0x55, 0x55, 0x52);
+    let stroke_colorref = COLORREF(stroke.to_colorref());
+
+    // Frame sits one pixel outside the active region so it never paints
+    // over rendered cells. GDI's Rectangle uses an exclusive bottom-right
+    // corner — passing right+1/bottom+1 makes the stroke land on the
+    // pixels immediately outside the grid.
+    let frame_left = active_area.left - 1;
+    let frame_top = active_area.top - 1;
+    let frame_right = active_area.right + 1;
+    let frame_bottom = active_area.bottom + 1;
+
+    unsafe {
+        let pen = CreatePen(PS_SOLID, 1, stroke_colorref);
+        let old_pen = SelectObject(hdc, pen);
+        let old_brush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+        let _ = Rectangle(hdc, frame_left, frame_top, frame_right, frame_bottom);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen);
+    }
+
+    // Label. Prefer the bottom margin if it exists, otherwise place it
+    // at the start of the right margin. Skip entirely if neither margin
+    // is large enough to hold readable text.
+    let label = if count <= 1 {
+        format!("{}x{}", c_cols, c_rows)
+    } else {
+        format!("{}x{} - min of {}", c_cols, c_rows, count)
+    };
+    let label_w: Vec<u16> = label.encode_utf16().collect();
+    let bottom_margin = area.bottom - active_area.bottom;
+    let right_margin = area.right - active_area.right;
+
+    unsafe {
+        let font = create_term_font(dpi, FONT_POINT_SIZE);
+        if font.is_invalid() {
+            return;
+        }
+        let old_font = SelectObject(hdc, font);
+        let _ = SetTextColor(hdc, stroke_colorref);
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let mut size = SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &label_w, &mut size);
+        // Bottom margin needs to clear the frame stroke (1 px) plus the
+        // label height; same for right margin's horizontal extent.
+        if active_area.bottom < area.bottom && bottom_margin >= size.cy + 2 {
+            let x = active_area.left + (active_area.right - active_area.left - size.cx) / 2;
+            let y = active_area.bottom + (bottom_margin - size.cy) / 2;
+            let _ = ExtTextOutW(
+                hdc,
+                x.max(area.left + 2),
+                y,
+                ETO_OPTIONS(0),
+                None,
+                PCWSTR::from_raw(label_w.as_ptr()),
+                label_w.len() as u32,
+                None,
+            );
+        } else if active_area.right < area.right && right_margin >= size.cx + 6 {
+            let x = active_area.right + 4;
+            let y = active_area.top;
+            let _ = ExtTextOutW(
+                hdc,
+                x,
+                y,
+                ETO_OPTIONS(0),
+                None,
+                PCWSTR::from_raw(label_w.as_ptr()),
+                label_w.len() as u32,
+                None,
+            );
+        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
     }
 }
 

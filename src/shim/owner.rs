@@ -165,6 +165,13 @@ pub fn run(session_id: String, args: Vec<OsString>, real: PathBuf) -> ExitCode {
     let local_size = Arc::new(Mutex::new(initial_size));
     let next_id = Arc::new(AtomicU64::new(1));
     let pty_in_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    // Serializes writes to the owner's local stdout. The PTY-out fanout
+    // writes claude's bytes there; the canonical-broadcast path also
+    // injects an OSC 9001 frame there so the manager-side view hosting
+    // this owner picks up the post-merge size (otherwise only remote
+    // subscribers ever see canonical). Without serialization the OSC
+    // could splice inside a half-written claude CSI and corrupt parsing.
+    let stdout_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
     let claude_alive = Arc::new(AtomicBool::new(true));
 
     // Addresses for closures (HANDLE/HPCON aren't Send).
@@ -177,11 +184,13 @@ pub fn run(session_id: String, args: Vec<OsString>, real: PathBuf) -> ExitCode {
     // PTY-out fan-out.
     {
         let subs = subscribers.clone();
+        let out_lock = stdout_lock.clone();
         thread::spawn(move || {
             pty_out_fanout(
                 HANDLE(h_out_addr as *mut _),
                 HANDLE(stdout_addr as *mut _),
                 subs,
+                out_lock,
             );
         });
     }
@@ -207,8 +216,12 @@ pub fn run(session_id: String, args: Vec<OsString>, real: PathBuf) -> ExitCode {
         let local_sz = local_size.clone();
         let nid = next_id.clone();
         let meta = meta.clone();
+        let out_lock = stdout_lock.clone();
         thread::spawn(move || {
-            accept_loop(meta, subs, lock, local_sz, nid, h_in_addr, hpc_addr);
+            accept_loop(
+                meta, subs, lock, local_sz, nid, h_in_addr, hpc_addr, stdout_addr,
+                out_lock,
+            );
         });
     }
 
@@ -217,8 +230,9 @@ pub fn run(session_id: String, args: Vec<OsString>, real: PathBuf) -> ExitCode {
         let subs = subscribers.clone();
         let local_sz = local_size.clone();
         let alive = claude_alive.clone();
+        let out_lock = stdout_lock.clone();
         thread::spawn(move || {
-            local_size_watcher(local_sz, subs, hpc_addr, alive);
+            local_size_watcher(local_sz, subs, hpc_addr, alive, stdout_addr, out_lock);
         });
     }
 
@@ -287,6 +301,7 @@ fn pty_out_fanout(
     h_out: HANDLE,
     stdout: HANDLE,
     subscribers: Arc<Mutex<HashMap<u64, Subscriber>>>,
+    stdout_lock: Arc<Mutex<()>>,
 ) {
     let mut buf = [0u8; 4096];
     loop {
@@ -296,7 +311,10 @@ fn pty_out_fanout(
             return;
         }
         let chunk = &buf[..n as usize];
-        let _ = write_all_h(stdout, chunk);
+        {
+            let _g = stdout_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = write_all_h(stdout, chunk);
+        }
 
         // Build a full O frame once and send a clone to every
         // subscriber's outbound channel. The actual blocking pipe write
@@ -367,6 +385,8 @@ fn accept_loop(
     next_id: Arc<AtomicU64>,
     h_in_addr: isize,
     hpc_addr: isize,
+    stdout_addr: isize,
+    stdout_lock: Arc<Mutex<()>>,
 ) {
     let pipe_path = protocol::session_pipe_name(&meta.session_id);
     let mut name_w: Vec<u16> = pipe_path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -425,9 +445,11 @@ fn accept_loop(
         let lock = pty_in_lock.clone();
         let local_sz = local_size.clone();
         let meta = meta.clone();
+        let out_lock = stdout_lock.clone();
         thread::spawn(move || {
             subscriber_thread(
                 id, pipe_addr, out_rx, subs, lock, local_sz, h_in_addr, hpc_addr, meta,
+                stdout_addr, out_lock,
             );
         });
     }
@@ -443,6 +465,8 @@ fn subscriber_thread(
     h_in_addr: isize,
     hpc_addr: isize,
     meta: Arc<SessionMeta>,
+    stdout_addr: isize,
+    stdout_lock: Arc<Mutex<()>>,
 ) {
     util::shim_log(format!("owner: subscriber-thread {id} started"));
     let pipe = HANDLE(pipe_addr as *mut _);
@@ -542,6 +566,7 @@ fn subscriber_thread(
                                 &g,
                                 *local_size.lock().unwrap_or_else(|p| p.into_inner()),
                             );
+                            let sub_count = g.len();
                             drop(g);
                             if was_hello {
                                 // Send a synthetic prelude (alt-screen +
@@ -570,6 +595,14 @@ fn subscriber_thread(
                                     thread::sleep(Duration::from_millis(50));
                                 }
                                 util::resize_pty_by_addr(hpc_addr, c, r);
+                                broadcast_canonical(
+                                    &subscribers,
+                                    c,
+                                    r,
+                                    sub_count,
+                                    stdout_addr,
+                                    &stdout_lock,
+                                );
                             }
                         }
                     }
@@ -589,6 +622,7 @@ fn subscriber_thread(
     g.remove(&id);
     let merged =
         merge_size_locked(&g, *local_size.lock().unwrap_or_else(|p| p.into_inner()));
+    let sub_count = g.len();
     drop(g);
     unsafe {
         let _ = DisconnectNamedPipe(pipe);
@@ -596,6 +630,14 @@ fn subscriber_thread(
     }
     if let Some((c, r)) = merged {
         util::resize_pty_by_addr(hpc_addr, c, r);
+        broadcast_canonical(
+            &subscribers,
+            c,
+            r,
+            sub_count,
+            stdout_addr,
+            &stdout_lock,
+        );
     }
 }
 
@@ -636,6 +678,8 @@ fn local_size_watcher(
     subscribers: Arc<Mutex<HashMap<u64, Subscriber>>>,
     hpc_addr: isize,
     claude_alive: Arc<AtomicBool>,
+    stdout_addr: isize,
+    stdout_lock: Arc<Mutex<()>>,
 ) {
     let mut last = current_console_size();
     while claude_alive.load(Ordering::Acquire) {
@@ -654,8 +698,60 @@ fn local_size_watcher(
         }
         let g = subscribers.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((c, r)) = merge_size_locked(&g, cur) {
+            let sub_count = g.len();
+            drop(g);
             util::resize_pty_by_addr(hpc_addr, c, r);
+            broadcast_canonical(
+                &subscribers,
+                c,
+                r,
+                sub_count,
+                stdout_addr,
+                &stdout_lock,
+            );
         }
+    }
+}
+
+/// Fan out the current canonical (post-merge) PTY size to every
+/// subscriber as a custom OSC frame, AND inject the same OSC into the
+/// owner's local stdout so the manager-side view hosting this owner
+/// updates its letterbox too. The widget on the other side parses the
+/// OSC out of the byte stream and uses it to letterbox regions outside
+/// the active grid. `sub_count` is the number of other clients sharing
+/// this session — purely informational, the widget uses it to label
+/// the constraint ("min of N").
+///
+/// Format: `ESC ] 9001 ; ccmon-canonical ; <cols> ; <rows> ; <n> BEL`.
+/// Real terminals receiving this (e.g. the original session's console)
+/// drop unknown OSCs silently, so the local stdout write is a no-op
+/// there. The local write goes through `stdout_lock` so the OSC can't
+/// splice inside a half-written claude CSI from the fanout thread.
+fn broadcast_canonical(
+    subscribers: &Arc<Mutex<HashMap<u64, Subscriber>>>,
+    cols: u16,
+    rows: u16,
+    sub_count: usize,
+    stdout_addr: isize,
+    stdout_lock: &Mutex<()>,
+) {
+    let body = format!("\x1b]9001;ccmon-canonical;{cols};{rows};{sub_count}\x07");
+    let bytes = body.as_bytes();
+    let mut frame = Vec::with_capacity(5 + bytes.len());
+    frame.extend_from_slice(&protocol::frame_header(TAG_OUTPUT, bytes.len() as u32));
+    frame.extend_from_slice(bytes);
+
+    let snapshot: Vec<Sender<Vec<u8>>> = {
+        let g = subscribers.lock().unwrap_or_else(|p| p.into_inner());
+        g.values().map(|s| s.out_tx.clone()).collect()
+    };
+    for tx in snapshot {
+        let _ = tx.send(frame.clone());
+    }
+
+    {
+        let _g = stdout_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = write_all_h(HANDLE(stdout_addr as *mut _), bytes);
     }
 }
 

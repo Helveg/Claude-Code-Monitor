@@ -132,6 +132,12 @@ pub struct Grid {
     pub scroll_top: u16,
     pub scroll_bottom: u16,
     pub current_attrs: CellAttrs,
+    /// Canonical (cols, rows, subscriber_count) reported by the owner shim via
+    /// our private OSC 9001. Set on subscribed terminals to the post-merge PTY
+    /// size — when smaller than the grid this signals that other clients are
+    /// attached with smaller viewports, and the view should letterbox.
+    /// `None` on owner-side or pre-handshake terminals.
+    pub canonical: Option<(u16, u16, u32)>,
     saved_cursor: Option<(u16, u16, CellAttrs)>,
     /// VT100 deferred-wrap flag. After writing to the last column we leave the
     /// cursor on that column with `pending_wrap = true`; the wrap actually
@@ -182,6 +188,7 @@ impl Grid {
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             current_attrs: CellAttrs::default(),
+            canonical: None,
             saved_cursor: None,
             pending_wrap: false,
             last_cursor_glyph_cell: None,
@@ -558,7 +565,13 @@ pub struct Parser {
     // alt screen toggle
     using_alt: bool,
     alt_grid: Option<Grid>,
+    /// Accumulated OSC body bytes between `ESC ]` and the terminator
+    /// (BEL or `ESC \`). Capped to keep a malformed/huge OSC from
+    /// growing unboundedly.
+    osc_buf: Vec<u8>,
 }
+
+const OSC_BUF_LIMIT: usize = 1024;
 
 impl Parser {
     pub fn new() -> Self {
@@ -572,6 +585,7 @@ impl Parser {
             utf8_expected: 0,
             using_alt: false,
             alt_grid: None,
+            osc_buf: Vec::new(),
         }
     }
 
@@ -602,7 +616,7 @@ impl Parser {
             }
             ParseState::Esc => self.esc_byte(grid, b),
             ParseState::Csi | ParseState::CsiPrivate => self.csi_byte(grid, b),
-            ParseState::Osc => self.osc_byte(b),
+            ParseState::Osc => self.osc_byte(grid, b),
         }
     }
 
@@ -969,18 +983,49 @@ impl Parser {
         }
     }
 
-    fn osc_byte(&mut self, b: u8) {
-        // Skip until BEL or ESC \
+    fn osc_byte(&mut self, grid: &mut Grid, b: u8) {
+        // Buffer body until BEL or ESC \. On terminator, dispatch our
+        // private OSCs and then drop the buffer regardless.
         match b {
-            0x07 => {
+            0x07 | 0x1B => {
+                self.dispatch_osc(grid);
+                self.osc_buf.clear();
                 self.state = ParseState::Ground;
             }
-            0x1B => {
-                // wait for backslash via Esc state, but we just go to Ground
-                self.state = ParseState::Ground;
+            _ => {
+                if self.osc_buf.len() < OSC_BUF_LIMIT {
+                    self.osc_buf.push(b);
+                }
             }
-            _ => {}
         }
+    }
+
+    /// Intercept OSC 9001 (ccmon private channel) and discard anything
+    /// else — matches the previous fire-and-forget behavior for OSCs we
+    /// don't recognize (window title, hyperlinks, etc).
+    fn dispatch_osc(&mut self, grid: &mut Grid) {
+        let body = match std::str::from_utf8(&self.osc_buf) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Expected: "9001;ccmon-canonical;<cols>;<rows>;<count>"
+        let mut parts = body.split(';');
+        if parts.next() != Some("9001") {
+            return;
+        }
+        if parts.next() != Some("ccmon-canonical") {
+            return;
+        }
+        let cols: u16 = match parts.next().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return,
+        };
+        let rows: u16 = match parts.next().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => return,
+        };
+        let count: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        grid.canonical = Some((cols, rows, count));
     }
 }
 
@@ -1393,5 +1438,61 @@ fn output_reader_loop(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(parser: &mut Parser, grid: &mut Grid, bytes: &[u8]) {
+        parser.feed(grid, bytes);
+    }
+
+    #[test]
+    fn canonical_osc_updates_grid() {
+        // Subscribed view receives the owner's private OSC and stores
+        // the post-merge size + subscriber count for letterboxing.
+        let mut p = Parser::new();
+        let mut g = Grid::new(100, 30);
+        feed(&mut p, &mut g, b"\x1b]9001;ccmon-canonical;80;24;3\x07");
+        assert_eq!(g.canonical, Some((80, 24, 3)));
+    }
+
+    #[test]
+    fn canonical_osc_accepts_st_terminator() {
+        // ESC \ (ST) is the alternate OSC terminator; many terminals
+        // prefer it over BEL. We must dispatch on either.
+        let mut p = Parser::new();
+        let mut g = Grid::new(100, 30);
+        feed(&mut p, &mut g, b"\x1b]9001;ccmon-canonical;40;12;2\x1b\\");
+        assert_eq!(g.canonical, Some((40, 12, 2)));
+    }
+
+    #[test]
+    fn unknown_osc_is_ignored_and_doesnt_corrupt_state() {
+        // Foreign OSCs (window title, hyperlinks, iTerm sequences)
+        // must be consumed silently without touching `canonical` and
+        // without leaking bytes into the grid.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b]0;some window title\x07hello");
+        assert_eq!(g.canonical, None);
+        // "hello" should land at row 0 col 0 — i.e. the OSC was eaten
+        // cleanly with no stray bytes reaching the grid.
+        assert_eq!(g.cell(0, 0).ch, 'h');
+        assert_eq!(g.cell(0, 4).ch, 'o');
+    }
+
+    #[test]
+    fn malformed_canonical_osc_is_ignored() {
+        // Missing count field, non-numeric dims, wrong prefix — none
+        // of these may panic or partially update `canonical`.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b]9001;ccmon-canonical;abc;def\x07");
+        assert_eq!(g.canonical, None);
+        feed(&mut p, &mut g, b"\x1b]9001;wrong-subtag;80;24;1\x07");
+        assert_eq!(g.canonical, None);
     }
 }

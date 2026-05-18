@@ -65,6 +65,14 @@ struct Panel {
     /// y-pixel offset between the thumb origin and the mouse, plus the
     /// last-seen tile bounds so wheel arithmetic still works mid-drag.
     cards_scroll_drag: Option<CardsScrollDrag>,
+    /// Card whose info region the cursor is currently over. Drives the
+    /// hover wash on the cards grid; recomputed on every WM_MOUSEMOVE
+    /// and cleared when the cursor leaves the grid entirely.
+    hovered_info_card: Option<crate::cards_tile::CardId>,
+    /// Card whose body is currently in "details" mode — id, type,
+    /// attachable, last-message summary instead of preview/summary.
+    /// Toggled by clicking the info region.
+    expanded_info_card: Option<crate::cards_tile::CardId>,
 }
 
 #[derive(Clone, Copy)]
@@ -150,31 +158,25 @@ pub fn open_panel() {
 
         *PANEL_HWND.lock().unwrap_or_else(|e| e.into_inner()) = hwnd.0 as isize;
 
-        // Initial session: one "claude" session filling the panel area,
-        // running the claude code CLI in the app's current working directory.
-        let session_id = crate::claude::new_session_id();
-        let claude_cmd = crate::claude::ClaudeArgs {
-            session_id: Some(session_id.clone()),
-            ..Default::default()
-        }
-        .build_command_line();
-        let cwd = std::env::current_dir().ok();
-        let session_view =
-            SessionView::new(hwnd, WM_APP_TERM_OUTPUT, "claude", claude_cmd, cwd.clone());
-        let mut sessions = Sessions::new();
-        let id = sessions.add("claude", session_view, cwd, session_id);
+        // Start with no sessions — the user opens one from the sidebar's
+        // "+ New session" entry (or by clicking an existing live/orphan
+        // session card). Auto-spawning surprised people who just wanted
+        // to glance at running sessions.
+        let sessions = Sessions::new();
 
         let view = PanelView::Dashboard { queue_mode: false };
 
         let mut panel = Panel {
             view,
-            focused_session: Some(id),
+            focused_session: None,
             sessions,
             layout_cache: Vec::new(),
             dragging_session: None,
             attention_queue: VecDeque::new(),
             cards_scroll_y: 0,
             cards_scroll_drag: None,
+            hovered_info_card: None,
+            expanded_info_card: None,
         };
         panel.recompute_layout(hwnd);
 
@@ -267,6 +269,48 @@ impl Panel {
                 // that jsonl is suppressed from the grid.
                 let claude_cmd = crate::claude::ClaudeArgs {
                     resume: Some(session_id.clone()),
+                    ..Default::default()
+                }
+                .build_command_line();
+                let view = SessionView::new(
+                    hwnd,
+                    WM_APP_TERM_OUTPUT,
+                    &name,
+                    claude_cmd,
+                    Some(cwd.clone()),
+                );
+                let id = self.sessions.add(name, view, Some(cwd), session_id);
+                self.set_focused_session(Some(id));
+                self.recompute_layout(hwnd);
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            dashboard::TileAction::ToggleCardInfo(id) => {
+                // Treat a click on an already-expanded info region as
+                // "collapse"; otherwise replace whatever was expanded
+                // (one-at-a-time keeps the grid orderly).
+                if self.expanded_info_card.as_ref() == Some(&id) {
+                    self.expanded_info_card = None;
+                } else {
+                    self.expanded_info_card = Some(id);
+                }
+                self.recompute_layout(hwnd);
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            dashboard::TileAction::AttachSession { session_id, cwd, name } => {
+                // Attaching = spawn `<shim>.exe --session-id <id>` in a
+                // fresh PTY. The shim sees that the per-session pipe
+                // already exists (the external owner is serving it) and
+                // runs in subscriber mode, so the manager's terminal
+                // becomes a live relay rather than a second owner. The
+                // local session entry uses the same UUID as the owner
+                // — the registry-based dedupe in sidebar_tile then hides
+                // the now-attached entry from the "remote" list.
+                let claude_cmd = crate::claude::ClaudeArgs {
+                    session_id: Some(session_id.clone()),
                     ..Default::default()
                 }
                 .build_command_line();
@@ -589,6 +633,7 @@ unsafe extern "system" fn panel_wnd_proc(
                             dashboard::CursorHint::IBeam => IDC_IBEAM,
                             dashboard::CursorHint::Hand => IDC_HAND,
                             dashboard::CursorHint::Arrow => IDC_ARROW,
+                            dashboard::CursorHint::Help => IDC_HELP,
                             dashboard::CursorHint::Default => {
                                 break;
                             }
@@ -722,6 +767,60 @@ unsafe extern "system" fn panel_wnd_proc(
                         tile.handle_mouse_move(x, y, &panel.sessions);
                     }
                 }
+
+                // Hit-test the cards grid once per move: drives the
+                // hover wash (info region only) AND auto-collapses
+                // the expanded details body when the cursor leaves
+                // the card it was anchored to. One walk for both so
+                // the layout build doesn't run twice.
+                let dpi = GetDpiForWindow(hwnd).max(96);
+                let mut hit: Option<crate::cards_tile::CardHit> = None;
+                for (tile, rect) in &panel.layout_cache {
+                    if !point_in(rect, x, y) {
+                        continue;
+                    }
+                    if let dashboard::Tile::SessionCardsGrid {
+                        include_orphans,
+                        scroll_y,
+                    } = tile
+                    {
+                        hit = cards_tile::card_hit_at(
+                            x,
+                            y,
+                            *rect,
+                            dpi,
+                            &panel.sessions,
+                            *include_orphans,
+                            *scroll_y,
+                        );
+                    }
+                    break;
+                }
+                let new_hover = hit
+                    .as_ref()
+                    .filter(|h| h.over_info)
+                    .map(|h| h.id.clone());
+                let mut dirty = false;
+                if new_hover != panel.hovered_info_card {
+                    panel.hovered_info_card = new_hover;
+                    dirty = true;
+                }
+                // Auto-collapse: if the cursor isn't inside the card
+                // whose info is currently expanded, clear the expand
+                // state. Moving back over the same card stays a click
+                // away from re-expanding — the user was reading the
+                // details and walked off it.
+                if let Some(expanded) = panel.expanded_info_card.as_ref() {
+                    let still_inside = hit.as_ref().map_or(false, |h| &h.id == expanded);
+                    if !still_inside {
+                        panel.expanded_info_card = None;
+                        panel.recompute_layout(hwnd);
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             LRESULT(0)
         }
@@ -798,6 +897,8 @@ unsafe extern "system" fn panel_wnd_proc(
             {
                 let panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(panel) = panel_guard.as_ref() {
+                    let hovered = panel.hovered_info_card.as_ref();
+                    let expanded = panel.expanded_info_card.as_ref();
                     for (tile, rect) in &panel.layout_cache {
                         tile.paint(
                             mem_dc,
@@ -805,6 +906,8 @@ unsafe extern "system" fn panel_wnd_proc(
                             dpi,
                             &panel.sessions,
                             panel.focused_session,
+                            hovered,
+                            expanded,
                         );
                     }
                 }
@@ -920,9 +1023,16 @@ unsafe extern "system" fn panel_wnd_proc(
                 if let Some(panel) = panel_guard.as_mut() {
                     if panel.recompute_statuses() {
                         panel.recompute_layout(hwnd);
-                        let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
+                // Always repaint on the 1 Hz tick: the sidebar /
+                // cards / notifications tiles also reflect external
+                // state (registry membership, remote jsonl activity)
+                // that doesn't go through `recompute_statuses`. A
+                // once-per-second paint is cheap and keeps every tile
+                // in sync without each having to wire up its own
+                // change-notification path.
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
