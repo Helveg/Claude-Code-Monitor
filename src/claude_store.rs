@@ -1,41 +1,34 @@
-//! Process-wide read-only snapshot of `~/.claude/projects/`.
+//! Read-only view of the jsonl transcripts for sessions *this manager
+//! spawned*.
 //!
-//! Each `<session-id>.jsonl` under `~/.claude/projects/<sanitized-path>/`
-//! is one claude session (NDJSON of user/assistant/system events). We
-//! periodically walk the tree, tail-read each jsonl, and expose the result
-//! as a flat list of `ClaudeSession` records — one per file, *not*
-//! aggregated by project. That way each individual conversation can show
-//! up as its own card in the dashboard's grid, including ones that happen
-//! to share a project directory with a live panel session.
+//! claude writes each conversation to
+//! `~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl` (NDJSON of
+//! user/assistant/system events). Because we pre-supply the UUID at spawn
+//! time via `--session-id`, we know exactly which filenames belong to us:
+//! callers [`track`] an id when they start a session, and the scanner only
+//! ever opens files whose stem is a tracked id. Sessions started outside
+//! the manager are never read.
 //!
-//! The scanner is mtime-driven: a fast 1 Hz tick walks the tree, skips any
-//! file whose mtime matches the previously-cached record, and only
-//! tail-reads files that have actually changed. That keeps the cost
-//! bounded while still surfacing "claude is writing right now" within ~1 s
-//! for the activity dot on orphan cards.
+//! The transcript is the status signal — it says who spoke last in
+//! structured form, which is far steadier than inferring the same thing
+//! from terminal output cadence.
+//!
+//! The scanner is mtime-driven: a 1 Hz tick walks the tree, skips any file
+//! whose mtime matches the cached record, and only tail-reads files that
+//! actually changed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use crate::diagnose;
-
 const SCAN_INTERVAL_MS: u64 = 1000;
-/// How many bytes to read from the tail of each jsonl. Most recent
-/// messages live near the end; full files can be many MB.
+/// How many bytes to read from the tail of each jsonl. The entries we care
+/// about live near the end; full files can be many MB.
 const TAIL_BYTES: u64 = 65_536;
-/// Max chars of last-message summary to surface on a card.
-const SUMMARY_MAX_CHARS: usize = 140;
-/// Files modified within this window count as "actively writing" — drives
-/// the green status dot regardless of last-speaker.
-const THINKING_WINDOW_MS: u64 = 2_500;
-/// Files older than this are treated as orphaned conversations and are
-/// rendered faded; within the window the card stays first-class.
-const ONGOING_WINDOW_MS: u64 = 30 * 60 * 1000;
 
 /// Who/what wrote the last meaningful entry in a jsonl. claude's tool
 /// loops produce alternating `assistant` (with tool_use blocks) and
@@ -51,65 +44,73 @@ pub enum LastSpeaker {
 
 #[derive(Clone, Debug)]
 pub struct ClaudeSession {
-    /// Absolute path to the jsonl on disk. Kept on the record so future
-    /// "reveal in explorer" / debug actions can reference it directly.
-    #[allow(dead_code)]
-    pub jsonl_path: PathBuf,
-    /// Session UUID parsed from any entry's `sessionId` field. Empty if
-    /// the file's contents didn't yield one.
-    pub session_id: String,
-    /// Canonical cwd as written by claude into the jsonl.
-    pub project_path: PathBuf,
     pub last_modified: SystemTime,
-    /// One-line summary of the most recent user-or-assistant message.
-    pub last_message_summary: String,
-    /// Number of `type: "user"` (human only) / `type: "assistant"` entries
-    /// observed in the tail slice — a lower bound on the conversation's
-    /// real length when files are larger than `TAIL_BYTES`.
-    pub message_count: u32,
-    /// Role of the most recent meaningful entry. Drives whether an idle
-    /// session reads as `NeedsAttention` (claude finished and is waiting)
-    /// or just `Idle`.
+    /// Role of the most recent meaningful entry. Separates "claude
+    /// finished and is waiting on you" from "claude is mid-tool-loop".
     pub last_speaker: LastSpeaker,
+    /// Tokens the conversation occupied at its last assistant turn — the
+    /// whole prompt claude was charged for, cache hits included. `None`
+    /// until an assistant entry with a `usage` block has been written.
+    pub context_tokens: Option<u64>,
+    /// Model id from the last assistant turn, e.g.
+    /// `claude-opus-4-5-20251101`. Decides the context limit.
+    pub model: Option<String>,
 }
 
-/// Activity state for an orphan/jsonl card. Mirrors the live-session
-/// status enum so the card chrome can render a matching dot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionActivity {
-    Thinking,
-    NeedsAttention,
-    Idle,
-    Stale,
+/// Models whose context window is the older 200K rather than the 1M the
+/// current generation ships with, matched by id prefix. Haiku is 200K at
+/// every version so far; the rest are the pre-4.6 Opus and Sonnet lines and
+/// everything from the claude-3 era.
+const SMALL_CONTEXT_MODELS: &[&str] = &[
+    "claude-haiku",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-opus-4-0",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-0",
+    "claude-3",
+];
+
+/// Context window of a model id, in tokens.
+///
+/// The current generation — Opus 4.6 and later, Sonnet 4.6 and later, Fable
+/// and Mythos — is 1M, so that's the default and an unrecognized id gets it
+/// too. A handful of older lines are still 200K and are listed out. The
+/// legacy `[1m]` suffix marked a long-context variant of a model that was
+/// otherwise 200K; ids carrying it are 1M whatever else they match.
+pub fn context_limit(model: &str) -> u64 {
+    if model.contains("[1m]") {
+        return 1_000_000;
+    }
+    if SMALL_CONTEXT_MODELS
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+    {
+        return 200_000;
+    }
+    1_000_000
 }
 
 impl ClaudeSession {
-    /// Derive an activity state from `last_modified` plus `last_speaker`.
-    /// Recent writes always read as `Thinking`. Once writes go quiet, the
-    /// last-speaker tag separates "claude finished, your turn"
-    /// (`NeedsAttention`) from "claude is in the middle of something"
-    /// (`Idle`). Anything older than `ONGOING_WINDOW_MS` reads `Stale`.
-    pub fn activity_at(&self, now: SystemTime) -> SessionActivity {
-        let age_ms = now
-            .duration_since(self.last_modified)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        if age_ms >= ONGOING_WINDOW_MS {
-            return SessionActivity::Stale;
-        }
-        if age_ms < THINKING_WINDOW_MS {
-            return SessionActivity::Thinking;
-        }
-        match self.last_speaker {
-            LastSpeaker::Assistant => SessionActivity::NeedsAttention,
-            _ => SessionActivity::Idle,
-        }
+    /// Context window this conversation is running against.
+    pub fn context_limit(&self) -> u64 {
+        self.model
+            .as_deref()
+            .map(context_limit)
+            .unwrap_or(1_000_000)
     }
 }
 
 #[derive(Clone)]
 pub struct ClaudeStore {
-    sessions: Arc<Mutex<HashMap<PathBuf, ClaudeSession>>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    /// Session ids the manager has spawned. The scanner reads a jsonl only
+    /// when its filename stem appears here.
+    tracked: Mutex<HashSet<String>>,
+    sessions: Mutex<HashMap<String, ClaudeSession>>,
 }
 
 static GLOBAL: OnceLock<ClaudeStore> = OnceLock::new();
@@ -119,68 +120,70 @@ pub fn global() -> &'static ClaudeStore {
     GLOBAL.get_or_init(ClaudeStore::start)
 }
 
+/// Start following the jsonl for a session we just spawned. Until an id is
+/// tracked its transcript is invisible to the store, so this must be called
+/// for every session the panel creates.
+pub fn track(session_id: &str) {
+    global().track(session_id);
+}
+
 impl ClaudeStore {
     fn start() -> Self {
-        let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let map = Arc::clone(&sessions);
+        let inner = Arc::new(Inner {
+            tracked: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        let scan_inner = Arc::clone(&inner);
         thread::Builder::new()
             .name("claude-store-scan".into())
-            .spawn(move || scanner_loop(map))
+            .spawn(move || scanner_loop(scan_inner))
             .ok();
-        Self { sessions }
+        Self { inner }
     }
 
-    /// Most recent session in the given cwd, if any. Used to attach a
-    /// "history" badge to live cards whose cwd matches a known project.
-    pub fn latest_for_cwd(&self, cwd: &Path) -> Option<ClaudeSession> {
-        let key = normalize_key(cwd);
-        let m = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        m.values()
-            .filter(|s| normalize_key(&s.project_path) == key)
-            .max_by_key(|s| s.last_modified)
-            .cloned()
+    fn track(&self, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        let mut t = self
+            .inner
+            .tracked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        t.insert(session_id.to_string());
     }
 
-    /// Look up a specific jsonl record by its session UUID. Returns `None`
-    /// if no scanned jsonl carries that id.
+    /// Latest transcript state for a tracked session. `None` until claude
+    /// has written the file, which only happens on the first message —
+    /// startup alone doesn't create it.
     pub fn lookup_by_session_id(&self, session_id: &str) -> Option<ClaudeSession> {
         if session_id.is_empty() {
             return None;
         }
-        let m = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        m.values().find(|s| s.session_id == session_id).cloned()
-    }
-
-    /// All known sessions, sorted newest-first.
-    pub fn snapshot(&self) -> Vec<ClaudeSession> {
-        let m = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        let mut v: Vec<ClaudeSession> = m.values().cloned().collect();
-        v.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
-        v
+        let m = self
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        m.get(session_id).cloned()
     }
 }
 
-/// Lower-case + forward-slash form, suitable for case-insensitive path
-/// comparison on Windows where claude writes `C:\` but rust paths may
-/// alternate between `\` and `/`. Exposed so `cards_tile` can compare
-/// session paths to live-session cwds under the same key.
-pub fn normalize_key(p: &Path) -> PathBuf {
-    let s: String = p
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c == '\\' { '/' } else { c.to_ascii_lowercase() })
-        .collect();
-    PathBuf::from(s)
-}
-
-fn scanner_loop(sessions: Arc<Mutex<HashMap<PathBuf, ClaudeSession>>>) {
+fn scanner_loop(inner: Arc<Inner>) {
     loop {
-        scan_once(&sessions);
+        scan_once(&inner);
         thread::sleep(Duration::from_millis(SCAN_INTERVAL_MS));
     }
 }
 
-fn scan_once(sessions: &Mutex<HashMap<PathBuf, ClaudeSession>>) {
+fn scan_once(inner: &Inner) {
+    let tracked: HashSet<String> = {
+        let t = inner.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        t.clone()
+    };
+    if tracked.is_empty() {
+        return;
+    }
     let Some(home) = dirs::home_dir() else {
         return;
     };
@@ -192,12 +195,12 @@ fn scan_once(sessions: &Mutex<HashMap<PathBuf, ClaudeSession>>) {
 
     // Snapshot the previous scan's records up front so we can reuse them
     // verbatim for files whose mtime hasn't changed — no re-parse cost.
-    let cached: HashMap<PathBuf, ClaudeSession> = {
-        let m = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let cached: HashMap<String, ClaudeSession> = {
+        let m = inner.sessions.lock().unwrap_or_else(|e| e.into_inner());
         m.clone()
     };
 
-    let mut new_map: HashMap<PathBuf, ClaudeSession> = HashMap::new();
+    let mut new_map: HashMap<String, ClaudeSession> = HashMap::new();
     for entry in project_dirs.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -212,30 +215,39 @@ fn scan_once(sessions: &Mutex<HashMap<PathBuf, ClaudeSession>>) {
             if !jsonl_path.extension().map_or(false, |x| x == "jsonl") {
                 continue;
             }
+            // claude names the file after the session UUID, so the stem is
+            // the whole ownership check — untracked transcripts are never
+            // opened.
+            let Some(session_id) = jsonl_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| tracked.contains(*s))
+                .map(str::to_string)
+            else {
+                continue;
+            };
             let mtime = match f.metadata().and_then(|m| m.modified()) {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            // Re-use the cached record if the file hasn't been touched
-            // since we last parsed it.
-            if let Some(prev) = cached.get(&jsonl_path) {
+            if let Some(prev) = cached.get(&session_id) {
                 if prev.last_modified == mtime {
-                    new_map.insert(jsonl_path, prev.clone());
+                    new_map.insert(session_id, prev.clone());
                     continue;
                 }
             }
             if let Some(session) = scan_jsonl(&jsonl_path, mtime) {
-                new_map.insert(jsonl_path, session);
+                new_map.insert(session_id, session);
             }
         }
     }
 
-    let mut m = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let mut m = inner.sessions.lock().unwrap_or_else(|e| e.into_inner());
     *m = new_map;
 }
 
 /// Tail-read one jsonl and assemble a `ClaudeSession`. Returns `None` if
-/// the file is empty or no `cwd` could be parsed from any line.
+/// the file couldn't be read.
 fn scan_jsonl(path: &Path, last_modified: SystemTime) -> Option<ClaudeSession> {
     let len = fs::metadata(path).ok()?.len();
     let mut file = fs::File::open(path).ok()?;
@@ -245,11 +257,9 @@ fn scan_jsonl(path: &Path, last_modified: SystemTime) -> Option<ClaudeSession> {
     file.read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
 
-    let mut project_path: Option<PathBuf> = None;
-    let mut session_id: Option<String> = None;
-    let mut last_summary: Option<String> = None;
     let mut last_speaker = LastSpeaker::Unknown;
-    let mut message_count: u32 = 0;
+    let mut context_tokens = None;
+    let mut model = None;
 
     let mut lines = text.lines();
     if start > 0 {
@@ -261,56 +271,52 @@ fn scan_jsonl(path: &Path, last_modified: SystemTime) -> Option<ClaudeSession> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if project_path.is_none() {
-            if let Some(c) = val.get("cwd").and_then(|x| x.as_str()) {
-                project_path = Some(PathBuf::from(c));
-            }
-        }
-        if session_id.is_none() {
-            if let Some(s) = val.get("sessionId").and_then(|x| x.as_str()) {
-                session_id = Some(s.to_string());
-            }
-        }
         let kind = val.get("type").and_then(|x| x.as_str()).unwrap_or("");
         if kind == "user" || kind == "assistant" {
             // claude's tool loops fake "user" entries for tool results —
             // distinguish them from real human input by content shape.
-            let speaker = if kind == "assistant" {
+            last_speaker = if kind == "assistant" {
                 LastSpeaker::Assistant
             } else if is_tool_result_user(&val) {
                 LastSpeaker::ToolResult
             } else {
                 LastSpeaker::Human
             };
-            last_speaker = speaker;
-            // Only count actual messages — tool_result entries shouldn't
-            // inflate the conversation length.
-            if !matches!(speaker, LastSpeaker::ToolResult) {
-                message_count = message_count.saturating_add(1);
+        }
+        if kind == "assistant" {
+            // Later turns overwrite earlier ones, so what survives the loop
+            // is the most recent turn's figure.
+            if let Some(tokens) = context_tokens_of(&val) {
+                context_tokens = Some(tokens);
             }
-            if let Some(s) = extract_message_text(&val) {
-                last_summary = Some(s);
+            if let Some(m) = val
+                .get("message")
+                .and_then(|m| m.get("model"))
+                .and_then(|m| m.as_str())
+            {
+                model = Some(m.to_string());
             }
         }
     }
-    if project_path.is_none() && diagnose::is_enabled() {
-        diagnose::log(format!(
-            "claude_store: no cwd found in {}",
-            path.display()
-        ));
-    }
-    let project_path = project_path?;
     Some(ClaudeSession {
-        jsonl_path: path.to_path_buf(),
-        session_id: session_id.unwrap_or_default(),
-        project_path,
         last_modified,
-        last_message_summary: last_summary
-            .map(|s| truncate_summary(&s))
-            .unwrap_or_default(),
-        message_count,
         last_speaker,
+        context_tokens,
+        model,
     })
+}
+
+/// Everything one assistant turn had in its context window: the fresh
+/// prompt, both cache buckets, and what it wrote back. Summed because
+/// cached input still occupies the window — it is only cheaper, not absent.
+fn context_tokens_of(val: &serde_json::Value) -> Option<u64> {
+    let usage = val.get("message").and_then(|m| m.get("usage"))?;
+    let field = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = field("input_tokens")
+        + field("cache_read_input_tokens")
+        + field("cache_creation_input_tokens")
+        + field("output_tokens");
+    (total > 0).then_some(total)
 }
 
 /// True if a `type: "user"` entry's `message.content` is an array of
@@ -328,52 +334,61 @@ fn is_tool_result_user(val: &serde_json::Value) -> bool {
         .any(|b| b.get("type").and_then(|x| x.as_str()) == Some("tool_result"))
 }
 
-/// Pull plain-text content out of one jsonl message entry. User entries
-/// store `message.content` as a string; assistant entries store it as a
-/// `[{type, text}]` array.
-fn extract_message_text(val: &serde_json::Value) -> Option<String> {
-    let msg = val.get("message")?;
-    let content = msg.get("content")?;
-    if let Some(s) = content.as_str() {
-        return Some(s.to_string());
-    }
-    if let Some(arr) = content.as_array() {
-        let mut out = String::new();
-        for block in arr {
-            if block.get("type").and_then(|x| x.as_str()) == Some("text") {
-                if let Some(t) = block.get("text").and_then(|x| x.as_str()) {
-                    if !out.is_empty() {
-                        out.push(' ');
-                    }
-                    out.push_str(t);
-                }
-            }
-        }
-        if !out.is_empty() {
-            return Some(out);
-        }
-    }
-    None
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn truncate_summary(s: &str) -> String {
-    let trimmed = s.trim();
-    let mut out = String::new();
-    let mut count = 0;
-    for ch in trimmed.chars() {
-        if count >= SUMMARY_MAX_CHARS {
-            out.push('…');
-            return out;
-        }
-        if ch == '\n' || ch == '\r' || ch == '\t' {
-            if !out.ends_with(' ') {
-                out.push(' ');
-                count += 1;
-            }
-        } else {
-            out.push(ch);
-            count += 1;
+    #[test]
+    fn context_tokens_sum_cache_buckets_and_output() {
+        let entry: serde_json::Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"model":"claude-opus-5",
+                "usage":{"input_tokens":12,"cache_read_input_tokens":30000,
+                         "cache_creation_input_tokens":500,"output_tokens":88}}}"#,
+        )
+        .unwrap();
+        assert_eq!(context_tokens_of(&entry), Some(30_600));
+    }
+
+    #[test]
+    fn a_turn_without_usage_reports_nothing() {
+        let entry: serde_json::Value =
+            serde_json::from_str(r#"{"type":"assistant","message":{"model":"x"}}"#).unwrap();
+        assert_eq!(context_tokens_of(&entry), None);
+    }
+
+    /// The current generation is 1M — an id we don't recognize is far more
+    /// likely to be a new model than an old one, so it gets 1M too.
+    #[test]
+    fn the_current_generation_has_the_million_token_window() {
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-6",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-fable-5",
+            "claude-something-not-released-yet",
+        ] {
+            assert_eq!(context_limit(model), 1_000_000, "{model}");
         }
     }
-    out
+
+    #[test]
+    fn the_older_lines_are_still_two_hundred_thousand() {
+        for model in [
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-1-20250805",
+            "claude-sonnet-4-5-20250929",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert_eq!(context_limit(model), 200_000, "{model}");
+        }
+    }
+
+    /// The legacy long-context suffix outranks the small-window list.
+    #[test]
+    fn the_long_context_suffix_wins() {
+        assert_eq!(context_limit("claude-sonnet-4-5[1m]"), 1_000_000);
+    }
 }

@@ -24,3 +24,6 @@ workflow.cmd
 
 # Local WinGet manifest generation output
 /manifests/
+
+# Agent worktrees (linked git worktrees, never part of a commit)
+.claude/worktrees/

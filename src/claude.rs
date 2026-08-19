@@ -1,13 +1,11 @@
 //! Build command lines for spawning the claude code CLI inside a session
 //! terminal. Handles the Windows-launch dance (`cmd.exe /c claude ...`) so
-//! `PATHEXT` resolves whichever shim the user installed (`claude.cmd`,
+//! `PATHEXT` resolves whichever launcher the user installed (`claude.cmd`,
 //! `claude.exe`, `claude.bat`) without us probing for them.
 //!
 //! Worktree / project-specific sessions don't need a special CLI flag —
 //! pass the worktree path as the session's `cwd` instead. claude reads its
 //! project context from the working directory.
-
-use std::path::PathBuf;
 
 use windows::Win32::System::Com::CoCreateGuid;
 
@@ -54,44 +52,16 @@ pub struct ClaudeArgs {
     pub extra: Vec<String>,
 }
 
-/// Locate our `claude.exe` shim co-located with the running manager
-/// binary. In production the installer puts `claude-manager.exe` and
-/// `claude.exe` in the same directory; dev builds put both in
-/// `target/debug/`. When found, the manager invokes the shim directly so
-/// subscribe-vs-spawn dispatch happens through our code path — without
-/// this, `cmd.exe /c claude` resolves to the user's real claude on PATH
-/// and the manager bypasses the shim entirely (so attach silently spawns
-/// a duplicate session instead of subscribing to the live one).
-fn shim_path() -> Option<PathBuf> {
-    let me = std::env::current_exe().ok()?;
-    let parent = me.parent()?;
-    let candidate = parent.join("claude.exe");
-    if candidate.is_file() && candidate != me {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
 impl ClaudeArgs {
-    /// Render the full Windows command line. Prefers our co-located shim
-    /// when present (so manager-launched sessions go through subscribe/
-    /// spawn dispatch); falls back to `cmd.exe /c claude` to handle
-    /// `claude.cmd`/`claude.bat` shims if the user has those on PATH and
-    /// our shim isn't installed.
+    /// Render the full Windows command line. Goes through `cmd.exe /c` so
+    /// `PATHEXT` resolves whichever `claude` launcher is on PATH
+    /// (`claude.cmd`, `claude.exe`, `claude.bat`).
     pub fn build_command_line(&self) -> String {
-        let prefix: Vec<String> = if let Some(shim) = shim_path() {
-            vec![shim.to_string_lossy().into_owned()]
-        } else {
-            vec!["cmd.exe".into(), "/c".into(), "claude".into()]
-        };
-        self.build_with_prefix(prefix)
+        self.build_with_prefix(vec!["cmd.exe".into(), "/c".into(), "claude".into()])
     }
 
     /// Compose `prefix` (the leading process spawn) with the rendered
-    /// claude args. Pulled out so unit tests can assert on a stable
-    /// prefix without depending on what `shim_path()` discovers in the
-    /// test runner's directory.
+    /// claude args.
     fn build_with_prefix(&self, mut parts: Vec<String>) -> String {
         if let Some(id) = &self.resume {
             parts.push("--resume".into());
@@ -164,13 +134,13 @@ pub fn quote_arg(arg: String) -> String {
 mod tests {
     use super::*;
 
-    fn legacy_prefix() -> Vec<String> {
+    fn prefix() -> Vec<String> {
         vec!["cmd.exe".into(), "/c".into(), "claude".into()]
     }
 
     #[test]
     fn default_command_is_just_claude() {
-        let cmd = ClaudeArgs::default().build_with_prefix(legacy_prefix());
+        let cmd = ClaudeArgs::default().build_with_prefix(prefix());
         assert_eq!(cmd, "cmd.exe /c claude");
     }
 
@@ -181,7 +151,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.build_with_prefix(legacy_prefix()),
+            args.build_with_prefix(prefix()),
             "cmd.exe /c claude --resume abc123"
         );
     }
@@ -194,7 +164,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.build_with_prefix(legacy_prefix()),
+            args.build_with_prefix(prefix()),
             "cmd.exe /c claude -c \"hello world\""
         );
     }
@@ -206,7 +176,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.build_with_prefix(legacy_prefix()),
+            args.build_with_prefix(prefix()),
             "cmd.exe /c claude \"she said \\\"hi\\\"\""
         );
     }
@@ -218,7 +188,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.build_with_prefix(legacy_prefix()),
+            args.build_with_prefix(prefix()),
             "cmd.exe /c claude --session-id 1904330e-14aa-4bee-a999-ed2371c72a76"
         );
     }

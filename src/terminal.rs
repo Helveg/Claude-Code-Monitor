@@ -2,6 +2,7 @@
 //! pseudo-console, reads its output on a worker thread, parses a subset of
 //! VT/ANSI sequences into a cell grid, and exposes input/resize for the UI.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
@@ -87,18 +88,56 @@ fn palette_256(i: u8) -> (u8, u8, u8) {
     (scale(r), scale(g), scale(b))
 }
 
+/// xterm mouse-tracking protocol selected by the TUI via DECSET. `None`
+/// means no mouse events should be sent to the PTY at all — anything else
+/// means scroll wheel / clicks over the terminal should be encoded and
+/// forwarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseProtocol {
+    #[default]
+    None,
+    /// ?1000h — button press/release only.
+    Normal,
+    /// ?1002h — press/release plus drag motion.
+    ButtonEvent,
+    /// ?1003h — press/release plus all motion.
+    AnyEvent,
+}
+
+/// Encoding used for mouse event bytes. We only support the legacy
+/// (X10-style) framing and SGR — the others (URxvt 1015, utf-8 1005)
+/// add cost without buying us anything TUI authors actually rely on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseEncoding {
+    #[default]
+    Legacy,
+    /// ?1006h — `ESC [ < b ; x ; y M/m`, no 95-cell column cap.
+    Sgr,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellAttrs {
     pub fg: Option<AnsiColor>,
     pub bg: Option<AnsiColor>,
     pub bold: bool,
+    /// SGR 2 — rendered by blending the foreground toward the background;
+    /// GDI has no faint attribute of its own.
+    pub dim: bool,
+    pub italic: bool,
     pub underline: bool,
+    pub strikethrough: bool,
     pub reverse: bool,
 }
 
 impl CellAttrs {
     fn reset(&mut self) {
         *self = CellAttrs::default();
+    }
+
+    /// True when any glyph-shaping / intensity attribute is set. Colors and
+    /// `reverse` don't count — see the cursor-glyph heuristic in `put_char`.
+    fn styled(&self) -> bool {
+        self.bold || self.dim || self.italic || self.underline || self.strikethrough
     }
 }
 
@@ -132,6 +171,19 @@ pub struct Grid {
     pub scroll_top: u16,
     pub scroll_bottom: u16,
     pub current_attrs: CellAttrs,
+    /// Mouse-tracking protocol the running TUI has requested. Drives whether
+    /// the host should encode WM_MOUSEWHEEL / button events and send them
+    /// through the PTY. `MouseProtocol::None` (default) means stay silent —
+    /// otherwise touchpad drivers fall back to fake arrow keys which trip
+    /// Claude Code's `arrow-burst` detector.
+    pub mouse_protocol: MouseProtocol,
+    pub mouse_encoding: MouseEncoding,
+    /// ?2004 — bracketed paste. When the TUI has enabled it, pasted text must
+    /// be delivered wrapped in `ESC[200~` / `ESC[201~` so the app can tell one
+    /// paste from a burst of typing. Claude Code relies on this: without the
+    /// brackets it reads a multi-line paste as separate submits and its
+    /// keystroke-coalescing heuristics chop the text into pieces.
+    pub bracketed_paste: bool,
     saved_cursor: Option<(u16, u16, CellAttrs)>,
     /// VT100 deferred-wrap flag. After writing to the last column we leave the
     /// cursor on that column with `pending_wrap = true`; the wrap actually
@@ -150,7 +202,28 @@ pub struct Grid {
     /// "last meaningful output" timestamp — so cursor blinks / pings that
     /// don't actually change the screen don't keep the status green.
     content_dirty: bool,
+    /// Lines that have scrolled off the top of the screen, oldest first.
+    /// Only fed from the primary buffer with a full-screen scroll region:
+    /// a TUI scrolling a sub-region (or the alt screen) is repainting, not
+    /// producing history. Each line keeps the width it had when it was
+    /// evicted; `display_cell` pads / truncates to the current width.
+    scrollback: VecDeque<Vec<Cell>>,
+    /// How many scrollback lines the viewport is shifted up by. 0 = live
+    /// screen. Capped at `scrollback.len()`.
+    view_offset: usize,
+    /// Lines dropped off the front of `scrollback` by the `SCROLLBACK_MAX`
+    /// cap. Counting them keeps [`viewport_origin`](Grid::viewport_origin)
+    /// monotonic, so absolute line indices stay valid once trimming starts.
+    trimmed_lines: u64,
+    /// True for the grid that backs the alt screen (?1049h). Alt-screen
+    /// content is transient, so it never feeds scrollback.
+    is_alt: bool,
 }
+
+/// Scrollback line cap. ~5k lines of an 80-wide grid is a few MB per
+/// session — enough to page back through a long tool run without letting
+/// a runaway `cat` grow the process without bound.
+const SCROLLBACK_MAX: usize = 5000;
 
 /// Replace `cells[start..end]` with `blank`, returning whether any cell
 /// actually differed before the write. Used by erase / scroll operations
@@ -182,10 +255,128 @@ impl Grid {
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             current_attrs: CellAttrs::default(),
+            mouse_protocol: MouseProtocol::None,
+            mouse_encoding: MouseEncoding::Legacy,
+            bracketed_paste: false,
             saved_cursor: None,
             pending_wrap: false,
             last_cursor_glyph_cell: None,
             content_dirty: false,
+            scrollback: VecDeque::new(),
+            view_offset: 0,
+            trimmed_lines: 0,
+            is_alt: false,
+        }
+    }
+
+    /// True while the alt screen (?1049h) is showing — a full-screen TUI
+    /// owns the viewport and there is no history to page through.
+    pub fn is_alt(&self) -> bool {
+        self.is_alt
+    }
+
+    /// Number of lines available above the live screen.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Lines the viewport is currently shifted up by. 0 = live screen.
+    pub fn view_offset(&self) -> usize {
+        self.view_offset
+    }
+
+    /// Shift the viewport by `delta` lines (positive = back in history).
+    /// Returns true when the offset actually moved.
+    pub fn scroll_view(&mut self, delta: i32) -> bool {
+        let target = self.view_offset as i64 + delta as i64;
+        let clamped = target.clamp(0, self.scrollback.len() as i64) as usize;
+        if clamped == self.view_offset {
+            return false;
+        }
+        self.view_offset = clamped;
+        true
+    }
+
+    /// Snap the viewport back to the live screen. Returns true if it moved.
+    pub fn scroll_view_to_bottom(&mut self) -> bool {
+        if self.view_offset == 0 {
+            return false;
+        }
+        self.view_offset = 0;
+        true
+    }
+
+    /// Absolute index of the line drawn at viewport row 0, in a space that
+    /// numbers every line the buffer has produced (scrollback first, then the
+    /// live screen). Scrolling moves the origin, not the text: a coordinate
+    /// in this space names the same line for as long as it is in scrollback,
+    /// which is what lets a selection stay on its text while the view moves.
+    pub fn viewport_origin(&self) -> u64 {
+        self.trimmed_lines + (self.scrollback.len() - self.view_offset) as u64
+    }
+
+    /// Cell at an absolute line index (see [`viewport_origin`](Self::viewport_origin)),
+    /// wherever the viewport happens to sit. Lines already trimmed out of
+    /// scrollback, and anything past the live screen, read back blank.
+    pub fn abs_cell(&self, line: u64, col: u16) -> Cell {
+        if line < self.trimmed_lines || col >= self.cols {
+            return Cell::default();
+        }
+        let idx = (line - self.trimmed_lines) as usize;
+        if idx < self.scrollback.len() {
+            return self.scrollback[idx]
+                .get(col as usize)
+                .copied()
+                .unwrap_or_default();
+        }
+        let live_row = idx - self.scrollback.len();
+        if live_row >= self.rows as usize {
+            return Cell::default();
+        }
+        self.cells[live_row * self.cols as usize + col as usize]
+    }
+
+    /// Cell at `row` in *viewport* coordinates: rows above `view_offset`
+    /// come out of scrollback, the rest out of the live screen. Renderers
+    /// and selection use this; grid-internal code indexes `cells` directly.
+    pub fn display_cell(&self, row: u16, col: u16) -> Cell {
+        if row >= self.rows || col >= self.cols {
+            return Cell::default();
+        }
+        let off = self.view_offset;
+        if (row as usize) < off {
+            // `off <= scrollback.len()` is an invariant, so this can't wrap.
+            let idx = self.scrollback.len() - off + row as usize;
+            return self.scrollback[idx]
+                .get(col as usize)
+                .copied()
+                .unwrap_or_default();
+        }
+        let live_row = row as usize - off;
+        if live_row >= self.rows as usize {
+            return Cell::default();
+        }
+        self.cells[live_row * self.cols as usize + col as usize]
+    }
+
+    /// Push the rows about to be evicted by a full-screen `scroll_up` into
+    /// scrollback, trimming to `SCROLLBACK_MAX`. When the user is scrolled
+    /// back, the offset grows with the history so the viewport stays put on
+    /// the same text instead of drifting as output arrives.
+    fn push_scrollback(&mut self, n: usize) {
+        let cols = self.cols as usize;
+        for row in 0..n {
+            let start = row * cols;
+            self.scrollback
+                .push_back(self.cells[start..start + cols].to_vec());
+        }
+        let overflow = self.scrollback.len().saturating_sub(SCROLLBACK_MAX);
+        for _ in 0..overflow {
+            self.scrollback.pop_front();
+        }
+        self.trimmed_lines += overflow as u64;
+        if self.view_offset > 0 {
+            self.view_offset = (self.view_offset + n).min(self.scrollback.len());
         }
     }
 
@@ -254,8 +445,7 @@ impl Grid {
             && attrs.reverse
             && attrs.fg.is_none()
             && attrs.bg.is_none()
-            && !attrs.bold
-            && !attrs.underline;
+            && !attrs.styled();
         if is_cursor_glyph {
             if let Some((pr, pc)) = self.last_cursor_glyph_cell {
                 let adjacent = pr == row && pc.abs_diff(col) <= 1;
@@ -265,8 +455,7 @@ impl Grid {
                         && prev.attrs.reverse
                         && prev.attrs.fg.is_none()
                         && prev.attrs.bg.is_none()
-                        && !prev.attrs.bold
-                        && !prev.attrs.underline;
+                        && !prev.attrs.styled();
                     if prev_is_glyph {
                         let i = self.idx(pr, pc);
                         self.cells[i] = Cell::default();
@@ -309,6 +498,10 @@ impl Grid {
         let cols = self.cols as usize;
         let blank = self.blank_cell();
         self.content_dirty = true;
+        // Only a full-screen scroll in the primary buffer produces history.
+        if !self.is_alt && top == 0 && bot + 1 == self.rows as usize {
+            self.push_scrollback(n);
+        }
         for row in top..=bot {
             let dst_start = row * cols;
             let dst_end = dst_start + cols;
@@ -350,8 +543,8 @@ impl Grid {
     }
 
     /// Cell to fill into erased / scrolled-out positions. Uses the current
-    /// background color so colored-background apps work, but drops bold /
-    /// underline / reverse so an active reverse-video SGR doesn't bleed into
+    /// background color so colored-background apps work, but drops the glyph
+    /// styling and reverse so an active reverse-video SGR doesn't bleed into
     /// erased regions and leave white blocks behind.
     fn blank_cell(&self) -> Cell {
         let mut attrs = CellAttrs::default();
@@ -530,6 +723,9 @@ impl Grid {
         self.scroll_bottom = rows.saturating_sub(1);
         self.cursor_row = self.cursor_row.min(rows - 1);
         self.cursor_col = self.cursor_col.min(cols - 1);
+        // A shorter screen can't show more history than exists, and the
+        // scrollback lines keep their old width — `display_cell` pads them.
+        self.view_offset = self.view_offset.min(self.scrollback.len());
     }
 }
 
@@ -543,6 +739,7 @@ enum ParseState {
     Esc,
     Csi,
     Osc,
+    OscEsc, // saw ESC while collecting an OSC/DCS body
     CsiPrivate, // saw ?
 }
 
@@ -558,7 +755,13 @@ pub struct Parser {
     // alt screen toggle
     using_alt: bool,
     alt_grid: Option<Grid>,
+    /// Accumulated OSC body bytes between `ESC ]` and the terminator
+    /// (BEL or `ESC \`). Capped to keep a malformed/huge OSC from
+    /// growing unboundedly.
+    osc_buf: Vec<u8>,
 }
+
+const OSC_BUF_LIMIT: usize = 1024;
 
 impl Parser {
     pub fn new() -> Self {
@@ -572,6 +775,7 @@ impl Parser {
             utf8_expected: 0,
             using_alt: false,
             alt_grid: None,
+            osc_buf: Vec::new(),
         }
     }
 
@@ -603,6 +807,7 @@ impl Parser {
             ParseState::Esc => self.esc_byte(grid, b),
             ParseState::Csi | ParseState::CsiPrivate => self.csi_byte(grid, b),
             ParseState::Osc => self.osc_byte(b),
+            ParseState::OscEsc => self.osc_esc_byte(grid, b),
         }
     }
 
@@ -671,6 +876,11 @@ impl Parser {
                 self.intermediate = 0;
             }
             b']' => {
+                self.state = ParseState::Osc;
+            }
+            b'P' | b'X' | b'^' | b'_' => {
+                // DCS / SOS / PM / APC — string sequences that share the OSC
+                // terminator (BEL or ST), so the same collector swallows them.
                 self.state = ParseState::Osc;
             }
             b'7' => {
@@ -915,15 +1125,59 @@ impl Parser {
                 1049 | 47 | 1047 => {
                     if enable && !self.using_alt {
                         let alt = mem::replace(grid, Grid::new(grid.cols, grid.rows));
+                        // Mouse mode is a property of the running TUI, not the
+                        // screen buffer — preserve it across the alt-screen swap
+                        // so wheel events keep flowing after the swap completes.
+                        // Same for bracketed paste.
+                        grid.mouse_protocol = alt.mouse_protocol;
+                        grid.mouse_encoding = alt.mouse_encoding;
+                        grid.bracketed_paste = alt.bracketed_paste;
+                        // The fresh grid *is* the alt screen; its scrolling is
+                        // repaint, not history. The primary buffer's scrollback
+                        // rides along inside `alt` and comes back on ?1049l.
+                        grid.is_alt = true;
                         self.alt_grid = Some(alt);
                         self.using_alt = true;
                     } else if !enable && self.using_alt {
-                        if let Some(saved) = self.alt_grid.take() {
+                        let preserved_proto = grid.mouse_protocol;
+                        let preserved_enc = grid.mouse_encoding;
+                        let preserved_bp = grid.bracketed_paste;
+                        if let Some(mut saved) = self.alt_grid.take() {
+                            saved.mouse_protocol = preserved_proto;
+                            saved.mouse_encoding = preserved_enc;
+                            saved.bracketed_paste = preserved_bp;
                             *grid = saved;
                         }
                         self.using_alt = false;
                     }
                 }
+                // ?1000 (Normal), ?1002 (ButtonEvent), ?1003 (AnyEvent) —
+                // xterm mouse-tracking protocols. The TUI requests one and
+                // we keep sending events at that level until it sends `l`.
+                1000 => {
+                    grid.mouse_protocol = if enable { MouseProtocol::Normal } else { MouseProtocol::None };
+                }
+                1002 => {
+                    grid.mouse_protocol = if enable { MouseProtocol::ButtonEvent } else { MouseProtocol::None };
+                }
+                1003 => {
+                    grid.mouse_protocol = if enable { MouseProtocol::AnyEvent } else { MouseProtocol::None };
+                }
+                // ?1006 — SGR mouse encoding. Lets us report column/row
+                // numbers >= 95 (legacy encoding caps at 223 columns after
+                // the 32 offset, and TUI-side parsing is simpler).
+                1006 => {
+                    grid.mouse_encoding = if enable { MouseEncoding::Sgr } else { MouseEncoding::Legacy };
+                }
+                // ?1007 — alternate-scroll: in alt-screen, terminal converts
+                // wheel to arrow keys. We never do that translation, so this
+                // is informational; we still accept the mode set so the TUI's
+                // DECRPM query (if it ever issues one) sees consistent state.
+                // We don't store it — our wheel handler simply forwards real
+                // mouse events when mouse_protocol is non-None.
+                1007 => {}
+                // ?2004 — bracketed paste. Read by the host when it pastes.
+                2004 => grid.bracketed_paste = enable,
                 _ => {}
             }
         }
@@ -940,11 +1194,24 @@ impl Parser {
             match p {
                 0 => grid.current_attrs.reset(),
                 1 => grid.current_attrs.bold = true,
+                2 => grid.current_attrs.dim = true,
+                3 => grid.current_attrs.italic = true,
                 4 => grid.current_attrs.underline = true,
                 7 => grid.current_attrs.reverse = true,
-                22 => grid.current_attrs.bold = false,
+                9 => grid.current_attrs.strikethrough = true,
+                // 21 is double-underline in ECMA-48 and bold-off in some
+                // terminals; drawing a single underline satisfies both readings
+                // better than ignoring it.
+                21 => grid.current_attrs.underline = true,
+                // 22 clears *both* intensity attributes.
+                22 => {
+                    grid.current_attrs.bold = false;
+                    grid.current_attrs.dim = false;
+                }
+                23 => grid.current_attrs.italic = false,
                 24 => grid.current_attrs.underline = false,
                 27 => grid.current_attrs.reverse = false,
+                29 => grid.current_attrs.strikethrough = false,
                 30..=37 => grid.current_attrs.fg = Some(AnsiColor::Indexed((p - 30) as u8)),
                 38 => {
                     if let Some((color, consumed)) = parse_extended_color(&self.params[i + 1..]) {
@@ -970,16 +1237,38 @@ impl Parser {
     }
 
     fn osc_byte(&mut self, b: u8) {
-        // Skip until BEL or ESC \
+        // Buffer the body until BEL or ST, then drop it. We render no
+        // OSC (window title, hyperlinks, iTerm sequences); buffering just
+        // keeps the payload bytes from leaking into the grid as text.
         match b {
             0x07 => {
+                self.osc_buf.clear();
                 self.state = ParseState::Ground;
             }
-            0x1B => {
-                // wait for backslash via Esc state, but we just go to Ground
-                self.state = ParseState::Ground;
+            // ESC starts the two-byte ST terminator; the `\` must be consumed
+            // there, never in Ground where it would print as a literal.
+            0x1B => self.state = ParseState::OscEsc,
+            _ => {
+                if self.osc_buf.len() < OSC_BUF_LIMIT {
+                    self.osc_buf.push(b);
+                }
             }
-            _ => {}
+        }
+    }
+
+    fn osc_esc_byte(&mut self, grid: &mut Grid, b: u8) {
+        self.osc_buf.clear();
+        if b == b'\\' {
+            // ST — string complete.
+            self.state = ParseState::Ground;
+        } else {
+            // A bare ESC inside the body aborts the string; the byte after it
+            // belongs to a fresh escape sequence.
+            self.state = ParseState::Esc;
+            self.params.clear();
+            self.current_param = None;
+            self.intermediate = 0;
+            self.esc_byte(grid, b);
         }
     }
 }
@@ -1019,16 +1308,11 @@ unsafe impl Sync for PtyInner {}
 
 impl Drop for PtyInner {
     fn drop(&mut self) {
-        // We deliberately do NOT TerminateProcess(h_process) here. The
-        // spawned process is our claude-shim, which has its own
-        // refcount-based lifecycle (terminal-attached + per-session
-        // pipe subscribers). Hard-killing it would defeat that — a
-        // session with external subscribers should survive when the
-        // manager panel closes. Closing the ConPTY hands the shim an
-        // EOF on stdin, which its `local_stdin_to_pty` thread treats
-        // as "my console went away" and propagates to the lifecycle
-        // watcher, which makes the right call (kill claude only if no
-        // subscribers are left).
+        // We deliberately do NOT TerminateProcess(h_process) here.
+        // `ClosePseudoConsole` tears down the child's console, which
+        // claude sees as its terminal going away and exits on — giving
+        // it the chance to flush its transcript and clean up. A hard
+        // kill would cut that short and can lose the tail of a session.
         unsafe {
             if self.hpc.0 != 0 {
                 ClosePseudoConsole(self.hpc);
@@ -1152,18 +1436,35 @@ impl Terminal {
                 None => return,
             }
         };
-        unsafe {
+        // WriteFile on a pipe is free to accept fewer bytes than offered — the
+        // input pipe's buffer is a few KB, so anything bigger (a paste) comes
+        // back short. Loop until the whole buffer is in, or the write fails.
+        let mut sent = 0usize;
+        while sent < data.len() {
             let mut written: u32 = 0;
-            let _ = WriteFile(
-                h,
-                Some(data),
-                Some(&mut written),
-                None,
-            );
+            let ok = unsafe {
+                WriteFile(
+                    h,
+                    Some(&data[sent..]),
+                    Some(&mut written),
+                    None,
+                )
+            };
+            if ok.is_err() || written == 0 {
+                break;
+            }
+            sent += written as usize;
         }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        // Relayout runs on scroll, focus changes and every window message
+        // that moves a tile, and hands each terminal the same dimensions it
+        // already had. Resizing a ConPTY makes the hosted TUI redraw from
+        // scratch, so a no-op resize is anything but free.
+        if self.cols == cols && self.rows == rows {
+            return;
+        }
         self.cols = cols;
         self.rows = rows;
         if let Ok(mut grid) = self.grid.lock() {
@@ -1393,5 +1694,269 @@ fn output_reader_loop(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(parser: &mut Parser, grid: &mut Grid, bytes: &[u8]) {
+        parser.feed(grid, bytes);
+    }
+
+    #[test]
+    fn unknown_osc_is_ignored_and_doesnt_corrupt_state() {
+        // OSCs (window title, hyperlinks, iTerm sequences) must be
+        // consumed silently without leaking bytes into the grid.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b]0;some window title\x07hello");
+        // "hello" should land at row 0 col 0 — i.e. the OSC was eaten
+        // cleanly with no stray bytes reaching the grid.
+        assert_eq!(g.cell(0, 0).ch, 'h');
+        assert_eq!(g.cell(0, 4).ch, 'o');
+    }
+
+    fn row_text(g: &Grid, row: u16) -> String {
+        (0..g.cols).map(|c| g.cell(row, c).ch).collect::<String>().trim_end().to_string()
+    }
+
+    #[test]
+    fn osc_terminated_by_st_doesnt_leak_a_backslash() {
+        // ST is two bytes (ESC \). Consuming only the ESC leaves the `\` to be
+        // printed as text — stray backslashes in the middle of rendered output.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b]0;title\x1b\\hello");
+        assert_eq!(row_text(&g, 0), "hello");
+    }
+
+    #[test]
+    fn osc8_hyperlink_wrapping_text_leaves_only_the_label() {
+        // OSC 8 (as emitted for clickable links) brackets the label with two
+        // ST-terminated OSCs.
+        let mut p = Parser::new();
+        let mut g = Grid::new(40, 5);
+        feed(
+            &mut p,
+            &mut g,
+            b"PR \x1b]8;;https://example.com/pull/232\x1b\\#232\x1b]8;;\x1b\\!",
+        );
+        assert_eq!(row_text(&g, 0), "PR #232!");
+    }
+
+    #[test]
+    fn dcs_body_is_swallowed() {
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1bP1$r0m\x1b\\ok");
+        assert_eq!(row_text(&g, 0), "ok");
+    }
+
+    #[test]
+    fn bare_esc_inside_osc_starts_a_fresh_sequence() {
+        // ESC followed by something other than `\` aborts the string; the
+        // following bytes are a new escape sequence, not text.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b]0;abc\x1b[31mred");
+        assert_eq!(row_text(&g, 0), "red");
+    }
+
+    #[test]
+    fn lines_scrolled_off_the_top_land_in_scrollback() {
+        // Six lines through a three-row screen: the first three scroll off
+        // and must be reachable again, in order, by paging the viewport up.
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 3);
+        feed(&mut p, &mut g, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+        assert_eq!(g.scrollback_len(), 3);
+        assert_eq!(g.display_cell(0, 0).ch, 'f'); // "four" is the live top row
+        assert!(g.scroll_view(3));
+        assert_eq!(g.view_offset(), 3);
+        assert_eq!(g.display_cell(0, 0).ch, 'o'); // "one"
+        assert_eq!(g.display_cell(1, 0).ch, 't'); // "two"
+        assert_eq!(g.display_cell(2, 0).ch, 't'); // "three"
+    }
+
+    #[test]
+    fn scroll_view_clamps_at_both_ends() {
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 2);
+        feed(&mut p, &mut g, b"a\r\nb\r\nc");
+        assert_eq!(g.scrollback_len(), 1);
+        // Past the oldest line clamps instead of wrapping, and a second
+        // attempt reports "didn't move" so the host can pass the wheel on.
+        assert!(g.scroll_view(50));
+        assert_eq!(g.view_offset(), 1);
+        assert!(!g.scroll_view(50));
+        assert!(g.scroll_view_to_bottom());
+        assert!(!g.scroll_view_to_bottom());
+    }
+
+    #[test]
+    fn alt_screen_scrolling_does_not_feed_scrollback() {
+        // A full-screen TUI redrawing itself is not history — and the
+        // primary buffer's scrollback must survive the round trip.
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 2);
+        feed(&mut p, &mut g, b"keep\r\nme\r\nnow");
+        assert_eq!(g.scrollback_len(), 1);
+        feed(&mut p, &mut g, b"\x1b[?1049h");
+        assert!(g.is_alt());
+        feed(&mut p, &mut g, b"x\r\ny\r\nz\r\nw");
+        assert_eq!(g.scrollback_len(), 0);
+        feed(&mut p, &mut g, b"\x1b[?1049l");
+        assert!(!g.is_alt());
+        assert_eq!(g.scrollback_len(), 1);
+    }
+
+    #[test]
+    fn scrolled_back_viewport_stays_pinned_as_output_arrives() {
+        // Output while the user is reading history must not yank the view
+        // out from under them: the offset grows with the scrollback.
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 2);
+        feed(&mut p, &mut g, b"one\r\ntwo\r\nthree");
+        assert!(g.scroll_view(1));
+        assert_eq!(g.display_cell(0, 0).ch, 'o');
+        feed(&mut p, &mut g, b"\r\nfour\r\nfive");
+        assert_eq!(g.view_offset(), 3);
+        assert_eq!(g.display_cell(0, 0).ch, 'o');
+    }
+
+    #[test]
+    fn absolute_line_coords_name_the_same_text_across_a_scroll() {
+        // What a selection relies on: the absolute index of a line doesn't
+        // change when the viewport moves or when new output arrives, so the
+        // highlight travels with its text instead of with the screen row.
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 2);
+        feed(&mut p, &mut g, b"one\r\ntwo\r\nthree");
+        // "one" is the only scrollback line, so it is absolute line 0.
+        let one = g.viewport_origin();
+        assert_eq!(one, 1); // viewport starts at "two"
+        assert_eq!(g.abs_cell(0, 0).ch, 'o');
+
+        g.scroll_view(1);
+        assert_eq!(g.viewport_origin(), 0);
+        assert_eq!(g.abs_cell(0, 0).ch, 'o');
+        assert_eq!(g.abs_cell(1, 0).ch, 't');
+
+        // Output while scrolled back pins the viewport, so the origin holds.
+        feed(&mut p, &mut g, b"\r\nfour");
+        assert_eq!(g.viewport_origin(), 0);
+        assert_eq!(g.abs_cell(0, 0).ch, 'o');
+
+        // Back at the live screen the origin moves, the text keeps its index.
+        g.scroll_view_to_bottom();
+        assert_eq!(g.viewport_origin(), 2); // "one" and "two" are history now
+        assert_eq!(g.abs_cell(0, 0).ch, 'o');
+        assert_eq!(g.abs_cell(3, 0).ch, 'f'); // "four", live bottom row
+    }
+
+    #[test]
+    fn absolute_line_coords_survive_scrollback_trimming() {
+        // Once the cap starts evicting lines, indices must keep counting up
+        // rather than sliding — otherwise a selection would drift onto text
+        // it never covered.
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 1);
+        for _ in 0..(SCROLLBACK_MAX + 10) {
+            feed(&mut p, &mut g, b"x\r\n");
+        }
+        assert_eq!(g.scrollback_len(), SCROLLBACK_MAX);
+        assert_eq!(g.viewport_origin(), SCROLLBACK_MAX as u64 + 10);
+        // Everything trimmed away reads blank instead of aliasing live text.
+        assert_eq!(g.abs_cell(0, 0).ch, ' ');
+        assert_eq!(g.abs_cell(10, 0).ch, 'x');
+    }
+
+    #[test]
+    fn mouse_tracking_dec_modes_round_trip() {
+        // ?1000 / ?1002 / ?1003 select the mouse-event protocol; ?1006
+        // switches to SGR encoding. We need to round-trip them so the
+        // host's wheel-forwarding decides correctly whether to emit a
+        // mouse event vs swallow the wheel.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b[?1000h");
+        assert_eq!(g.mouse_protocol, MouseProtocol::Normal);
+        feed(&mut p, &mut g, b"\x1b[?1002h");
+        assert_eq!(g.mouse_protocol, MouseProtocol::ButtonEvent);
+        feed(&mut p, &mut g, b"\x1b[?1003h");
+        assert_eq!(g.mouse_protocol, MouseProtocol::AnyEvent);
+        feed(&mut p, &mut g, b"\x1b[?1006h");
+        assert_eq!(g.mouse_encoding, MouseEncoding::Sgr);
+        feed(&mut p, &mut g, b"\x1b[?1006l");
+        assert_eq!(g.mouse_encoding, MouseEncoding::Legacy);
+        feed(&mut p, &mut g, b"\x1b[?1003l");
+        assert_eq!(g.mouse_protocol, MouseProtocol::None);
+    }
+
+    #[test]
+    fn mouse_mode_survives_alt_screen_swap() {
+        // TUIs request mouse tracking before flipping to the alt screen
+        // and expect it to keep working there. If we lost the mode on
+        // the buffer swap, scrolling inside the TUI would suddenly fall
+        // back to the wheel-into-arrow-keys path.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b[?1000h\x1b[?1006h");
+        feed(&mut p, &mut g, b"\x1b[?1049h");
+        assert_eq!(g.mouse_protocol, MouseProtocol::Normal);
+        assert_eq!(g.mouse_encoding, MouseEncoding::Sgr);
+        feed(&mut p, &mut g, b"\x1b[?1049l");
+        assert_eq!(g.mouse_protocol, MouseProtocol::Normal);
+        assert_eq!(g.mouse_encoding, MouseEncoding::Sgr);
+    }
+
+    #[test]
+    fn bracketed_paste_mode_tracks_and_survives_alt_screen() {
+        // Claude Code enables ?2004 from the primary buffer and then flips to
+        // the alt screen. The host reads this flag to decide whether a paste
+        // gets its ESC[200~ framing, so losing it on the swap would silently
+        // turn every paste back into a burst of keystrokes.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        assert!(!g.bracketed_paste);
+        feed(&mut p, &mut g, b"\x1b[?2004h");
+        assert!(g.bracketed_paste);
+        feed(&mut p, &mut g, b"\x1b[?1049h");
+        assert!(g.bracketed_paste);
+        feed(&mut p, &mut g, b"\x1b[?1049l");
+        assert!(g.bracketed_paste);
+        feed(&mut p, &mut g, b"\x1b[?2004l");
+        assert!(!g.bracketed_paste);
+    }
+
+    #[test]
+    fn sgr_glyph_attributes_set_and_clear() {
+        // claude code writes its preview text as faint + italic; dropping
+        // either one renders it as ordinary body text.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b[2;3mab\x1b[23md\x1b[22me");
+        assert!(g.cell(0, 0).attrs.dim && g.cell(0, 0).attrs.italic);
+        assert!(g.cell(0, 1).attrs.dim && g.cell(0, 1).attrs.italic);
+        // 23 clears italic, leaving faint alone.
+        assert!(g.cell(0, 2).attrs.dim && !g.cell(0, 2).attrs.italic);
+        // 22 clears faint (and bold) but nothing else.
+        assert!(!g.cell(0, 3).attrs.dim);
+
+        // 22 is both-intensities-off: bold set alongside faint goes too.
+        feed(&mut p, &mut g, b"\r\n\x1b[1;2mx\x1b[22my");
+        assert!(g.cell(1, 0).attrs.bold && g.cell(1, 0).attrs.dim);
+        assert!(!g.cell(1, 1).attrs.bold && !g.cell(1, 1).attrs.dim);
+
+        feed(&mut p, &mut g, b"\r\n\x1b[4;9mu\x1b[24;29mv");
+        assert!(g.cell(2, 0).attrs.underline && g.cell(2, 0).attrs.strikethrough);
+        assert!(!g.cell(2, 1).attrs.underline && !g.cell(2, 1).attrs.strikethrough);
+
+        // SGR 0 wipes the lot.
+        feed(&mut p, &mut g, b"\r\n\x1b[1;2;3;4;9mz\x1b[0mw");
+        assert!(g.cell(3, 0).attrs.styled());
+        assert!(!g.cell(3, 1).attrs.styled());
     }
 }

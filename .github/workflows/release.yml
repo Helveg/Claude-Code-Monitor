@@ -58,7 +58,7 @@ jobs:
           Get-ChildItem target\wix\*.msi | Select-Object Name, Length, LastWriteTime
           Write-Host ""
           Write-Host "Binaries:"
-          Get-ChildItem target\release\claude-manager.exe, target\release\claude.exe | Select-Object Name, Length
+          Get-ChildItem target\release\claude-manager.exe | Select-Object Name, Length
 
       # Always upload artifacts — useful for testing PRs / manual runs
       # without cutting a release.
@@ -74,7 +74,6 @@ jobs:
           name: claude-manager-binaries
           path: |
             target/release/claude-manager.exe
-            target/release/claude.exe
 
       # Only attach to a GitHub Release on tag push. Manual runs and
       # future branch CI invocations skip this step entirely.
@@ -85,6 +84,5 @@ jobs:
           files: |
             target/wix/claude-manager-*.msi
             target/release/claude-manager.exe
-            target/release/claude.exe
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -28,6 +28,7 @@ use crate::native_interop::{
     TIMER_UPDATE_CHECK,
     WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
+use crate::sessions::SavedSession;
 use crate::tray_icon;
 use crate::poller;
 use crate::theme;
@@ -89,6 +90,18 @@ struct AppState {
     widget_visible: bool,
     layout_tier: LayoutTier,
     tooltip_hwnd: Option<SendHwnd>,
+    /// `cols x rows` the panel's grid view lays sessions out in, as last
+    /// chosen from the view button's picker. Lives here rather than on the
+    /// panel so it survives the panel being closed and reopened, and so
+    /// `save_state_settings` has it to write.
+    grid_cols: i32,
+    grid_rows: i32,
+    /// Point size the panel's terminals render at, as last zoomed to.
+    font_pt: i32,
+    /// Sessions the panel had open the last time it was closed. Lives here
+    /// for the same reason the grid size does: the panel is created and
+    /// destroyed many times over a run, and this has to outlive it.
+    open_sessions: Vec<SavedSession>,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +225,18 @@ struct SettingsFile {
     segment_w_design: i32,
     #[serde(default)]
     layout_tier: LayoutTier,
+    #[serde(default = "default_grid_cols")]
+    grid_cols: i32,
+    #[serde(default = "default_grid_rows")]
+    grid_rows: i32,
+    /// Point size the dashboard's terminal renders at; the grid's cells
+    /// follow it, one size smaller.
+    #[serde(default = "default_font_pt")]
+    font_pt: i32,
+    /// Sessions the panel had open when it was last closed. Restored as
+    /// resume cards, never re-run on their own.
+    #[serde(default)]
+    sessions: Vec<SavedSession>,
 }
 
 impl Default for SettingsFile {
@@ -224,12 +249,28 @@ impl Default for SettingsFile {
             widget_visible: true,
             segment_w_design: default_segment_w_design(),
             layout_tier: LayoutTier::default(),
+            grid_cols: default_grid_cols(),
+            grid_rows: default_grid_rows(),
+            font_pt: default_font_pt(),
+            sessions: Vec::new(),
         }
     }
 }
 
+fn default_font_pt() -> i32 {
+    crate::terminal_view::FONT_POINT_SIZE
+}
+
 fn default_segment_w_design() -> i32 {
     DEFAULT_SEGMENT_W
+}
+
+fn default_grid_cols() -> i32 {
+    action_window::DEFAULT_GRID_COLS
+}
+
+fn default_grid_rows() -> i32 {
+    action_window::DEFAULT_GRID_ROWS
 }
 
 fn default_poll_interval() -> u32 {
@@ -271,8 +312,92 @@ fn save_state_settings() {
             widget_visible: s.widget_visible,
             segment_w_design: s.segment_w_design,
             layout_tier: s.layout_tier,
+            grid_cols: s.grid_cols,
+            grid_rows: s.grid_rows,
+            font_pt: s.font_pt,
+            sessions: s.open_sessions.clone(),
         });
     }
+}
+
+/// Point size the panel's terminals should open at.
+pub fn saved_font_pt() -> i32 {
+    let state = lock_state();
+    match state.as_ref() {
+        Some(s) => s.font_pt,
+        None => default_font_pt(),
+    }
+}
+
+/// Remember a zoom level. Like the grid size, this writes settings.json
+/// straight away — the panel outlives no process boundary of its own.
+pub fn set_saved_font_pt(font_pt: i32) {
+    {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        if s.font_pt == font_pt {
+            return;
+        }
+        s.font_pt = font_pt;
+    }
+    save_state_settings();
+}
+
+/// The workspace the panel should come back to: the sessions it had open
+/// when it was last closed, newest arrangement first written by
+/// [`set_saved_sessions`].
+pub fn saved_sessions() -> Vec<SavedSession> {
+    let state = lock_state();
+    match state.as_ref() {
+        Some(s) => s.open_sessions.clone(),
+        None => Vec::new(),
+    }
+}
+
+/// Remember the panel's open sessions. Writes settings.json only when the
+/// list actually changed, so the panel can call this on its 1 Hz tick and
+/// survive a crash without a session's worth of disk churn.
+pub fn set_saved_sessions(sessions: Vec<SavedSession>) {
+    {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        if s.open_sessions == sessions {
+            return;
+        }
+        s.open_sessions = sessions;
+    }
+    save_state_settings();
+}
+
+/// The grid size the panel should open with — the last one the user picked.
+pub fn saved_grid_size() -> (i32, i32) {
+    let state = lock_state();
+    match state.as_ref() {
+        Some(s) => (s.grid_cols, s.grid_rows),
+        None => (default_grid_cols(), default_grid_rows()),
+    }
+}
+
+/// Remember a grid size picked in the panel. Writes settings.json straight
+/// away: the panel outlives no process boundary of its own, and a crash
+/// shouldn't cost the choice.
+pub fn set_saved_grid_size(cols: i32, rows: i32) {
+    {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        if s.grid_cols == cols && s.grid_rows == rows {
+            return;
+        }
+        s.grid_cols = cols;
+        s.grid_rows = rows;
+    }
+    save_state_settings();
 }
 
 fn tray_icon_data_from_state() -> (Option<f64>, String) {
@@ -296,6 +421,39 @@ fn widget_tooltip_text(s: &AppState) -> String {
         "{}: {}\n{}: {}",
         strings.session_window, s.session_text, strings.weekly_window, s.weekly_text
     )
+}
+
+/// One quota row, as both the taskbar widget and the panel's caption strip
+/// draw it: a localized window label, the utilization the bar fills to, and
+/// the "42% · 2h 10m" line that spells it out.
+pub struct QuotaRow {
+    pub label: &'static str,
+    pub percent: f64,
+    pub text: String,
+}
+
+/// The session and weekly rows for anything outside the widget that mirrors
+/// them. `None` while the last poll failed — a bar left at its old fill
+/// reads as live data, so callers draw nothing at all instead.
+pub fn quota_rows() -> Option<[QuotaRow; 2]> {
+    let state = lock_state();
+    let s = state.as_ref()?;
+    if !s.last_poll_ok {
+        return None;
+    }
+    let strings = s.language.strings();
+    Some([
+        QuotaRow {
+            label: strings.session_window,
+            percent: s.session_percent,
+            text: s.session_text.clone(),
+        },
+        QuotaRow {
+            label: strings.weekly_window,
+            percent: s.weekly_percent,
+            text: s.weekly_text.clone(),
+        },
+    ])
 }
 
 // Custom hover tooltip — a tiny owner-less WS_POPUP that we paint
@@ -1296,6 +1454,10 @@ pub fn run() {
                 widget_visible: settings.widget_visible,
                 layout_tier: settings.layout_tier,
                 tooltip_hwnd: None,
+                grid_cols: settings.grid_cols.clamp(1, crate::grid_tile::MAX_GRID),
+                grid_rows: settings.grid_rows.clamp(1, crate::grid_tile::MAX_GRID),
+                font_pt: crate::terminal_view::clamp_font_pt(settings.font_pt),
+                open_sessions: settings.sessions.clone(),
             });
         }
 
@@ -2515,6 +2677,7 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_COUNTDOWN => {
                     update_display();
                     render_layered();
+                    action_window::refresh_quota_strip();
                     update_widget_tooltip();
                     schedule_countdown_timer();
                 }
@@ -2547,6 +2710,7 @@ unsafe extern "system" fn wnd_proc(
             check_theme_change();
             check_language_change();
             render_layered();
+            action_window::refresh_quota_strip();
             schedule_countdown_timer();
             let (pct, tooltip) = tray_icon_data_from_state();
             tray_icon::update(hwnd, pct, &tooltip);

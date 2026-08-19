@@ -1,21 +1,20 @@
 pub mod action_window;
-pub mod cards_tile;
+pub mod agent_state;
 pub mod claude;
 pub mod claude_store;
 pub mod dashboard;
 pub mod diagnose;
+pub mod grid_tile;
 pub mod highlight;
 pub mod localization;
 pub mod models;
 pub mod native_interop;
-pub mod notifications_tile;
 pub mod poller;
-pub mod real_claude;
-pub mod registry;
+pub mod project_tree;
+pub mod projects;
+pub mod resume_card;
 pub mod session_view;
-pub mod shim;
 pub mod sessions;
-pub mod sidebar_tile;
 pub mod terminal;
 pub mod terminal_view;
 pub mod theme;
@@ -61,7 +60,10 @@ pub fn run() {
         std::process::exit(exit_code);
     }
 
-    registry::start_server();
+    // Start the project scanner before the UI exists so the nav tree is
+    // already populated by the time the user opens the panel. The scan runs
+    // on its own thread; this call just spawns it.
+    projects::global();
 
     if diagnose_enabled {
         diagnose::log("entering window::run");

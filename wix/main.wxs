@@ -103,32 +103,6 @@
                     </Component>
                     
                     <Directory Id='Bin' Name='bin'>
-                        <Component Id='Path' Guid='0F25B01F-7B70-43D6-A6AE-EFA466B305D3' KeyPath='yes'>
-                            <!--
-                              Part='first' (not 'last') is load-bearing: our `claude.exe`
-                              has to win PATHEXT/PATH lookup over the user's existing
-                              real claude (typically at %APPDATA%\npm\claude.cmd or
-                              %USERPROFILE%\.local\bin\claude.exe). If we land at the
-                              end of PATH, the real claude resolves first and our
-                              shim never gets called.
-                            -->
-                            <Environment
-                                Id='PATH'
-                                Name='PATH'
-                                Value='[Bin]'
-                                Permanent='no'
-                                Part='first'
-                                Action='set'
-                                System='yes'/>
-                        </Component>
-                        <Component Id='binary0' Guid='*'>
-                            <File
-                                Id='exe0'
-                                Name='claude.exe'
-                                DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\claude.exe'
-                                KeyPath='yes'/>
-                        </Component>
                         <Component Id='binary1' Guid='*'>
                             <File
                                 Id='exe1'
@@ -165,18 +139,8 @@
               the license sidecar file from the installer.
             -->
             <ComponentRef Id='License'/>
-            
-            <ComponentRef Id='binary0'/>
-            <ComponentRef Id='binary1'/>
 
-            <Feature
-                Id='Environment'
-                Title='PATH Environment Variable'
-                Description='Add the install location of the [ProductName] executable to the PATH system environment variable. This allows the [ProductName] executable to be called from any location.'
-                Level='1'
-                Absent='allow'>
-                <ComponentRef Id='Path'/>
-            </Feature>
+            <ComponentRef Id='binary1'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
