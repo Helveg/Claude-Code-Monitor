@@ -524,6 +524,7 @@ impl Panel {
                     *cols,
                     *rows,
                 )
+                .map(|body| body.bounds)
             }
             _ => None,
         })
@@ -915,6 +916,33 @@ impl Panel {
         };
         self.focused_session = Some(next);
         self.acknowledge(next);
+        true
+    }
+
+    /// Bring the focused conversation's cell into view. Ctrl+Tab can land
+    /// on a cell the grid has scrolled past, and a focus you can't see
+    /// reads as nothing having happened. Returns `true` when the grid
+    /// actually moved.
+    fn scroll_focus_into_view(&mut self, hwnd: HWND) -> bool {
+        let (Some((rect, _, cols, rows)), Some(id)) =
+            (self.grid_tile_layout(), self.focused_session)
+        else {
+            return false;
+        };
+        let dpi = unsafe { GetDpiForWindow(hwnd).max(96) };
+        let target = grid_tile::scroll_to_show(
+            rect,
+            dpi,
+            &self.sessions,
+            self.grid_scroll_y,
+            cols,
+            rows,
+            id,
+        );
+        if target == self.grid_scroll_y {
+            return false;
+        }
+        self.grid_scroll_y = target;
         true
     }
 
@@ -1893,6 +1921,8 @@ unsafe extern "system" fn panel_wnd_proc(
                                 *cols,
                                 *rows,
                             )
+                            .filter(|body| point_in(&body.visible, x, y))
+                            .map(|body| body.bounds)
                         }
                         dashboard::Tile::ProjectTree => Some(*rect),
                         _ => None,
@@ -1977,6 +2007,10 @@ unsafe extern "system" fn panel_wnd_proc(
         WM_MOUSEWHEEL => {
             // wparam high word = wheel delta (signed), positive scrolls up.
             let delta = ((wparam.0 >> 16) as i16) as i32;
+            // Low word holds the mouse/modifier flags; MK_SHIFT = 0x0004.
+            // Shift makes the wheel address the grid itself rather than
+            // whatever cell sits under the cursor.
+            let shift = (wparam.0 & 0x0004) != 0;
             // Screen coords come in lparam; convert to client to find the
             // tile under the cursor.
             let mut pt = POINT {
@@ -2042,8 +2076,9 @@ unsafe extern "system" fn panel_wnd_proc(
                             cols,
                             rows,
                         )
-                        .filter(|body| point_in(body, pt.x, pt.y));
-                        if let Some(body) = over_tree {
+                        .filter(|body| point_in(&body.visible, pt.x, pt.y))
+                        .map(|body| body.bounds);
+                        if let Some(body) = over_tree.filter(|_| !shift) {
                             let line_px = (30.0 * scale).round() as i32;
                             let target = panel.nav_scroll_y - (delta * line_px) / 120;
                             let new_scroll = {
@@ -2077,7 +2112,7 @@ unsafe extern "system" fn panel_wnd_proc(
                             rows,
                         )
                         .and_then(|id| panel.sessions.get(id));
-                        if let Some(session) = over_terminal {
+                        if let Some(session) = over_terminal.filter(|_| !shift) {
                             let notches = delta / 120;
                             if session
                                 .session_view
@@ -2215,7 +2250,13 @@ unsafe extern "system" fn panel_wnd_proc(
                 if let Some(panel) = panel_guard.as_mut() {
                     let queue_len = panel.attention_queue.len();
                     let advanced = match panel.view {
-                        PanelView::Grid => panel.cycle_grid_focus(),
+                        PanelView::Grid => {
+                            let advanced = panel.cycle_grid_focus();
+                            if advanced {
+                                panel.scroll_focus_into_view(hwnd);
+                            }
+                            advanced
+                        }
                         PanelView::Dashboard { .. } => panel.cycle_attention_queue(),
                     };
                     if crate::diagnose::is_enabled() {

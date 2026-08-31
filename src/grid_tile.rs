@@ -411,9 +411,23 @@ fn scrollbar_rects(bounds: &RECT, plan: &GridPlan, dpi: u32, scroll_y: i32) -> O
     Some((track, thumb))
 }
 
-/// The region of the project cell that the tree itself is drawn into.
-/// The panel routes hover / wheel / click there so the tree behaves exactly
-/// as it does in the sidebar. `None` when the cell is scrolled out of view.
+/// Where the project tree lives inside the grid, for the panel to route
+/// hover / wheel / click at it so it behaves exactly as it does in the
+/// sidebar.
+#[derive(Clone, Copy)]
+pub struct ProjectBody {
+    /// The rect the tree lays itself out from — the same one [`paint`]
+    /// hands it. A half-scrolled cell keeps its origin above the tile, so
+    /// hit-testing against this rect lands on the row under the pointer.
+    pub bounds: RECT,
+    /// The part of `bounds` inside the tile. A point has to be in here to
+    /// reach the tree at all, so a scrolled-off row can't be clicked where
+    /// the grid paints something else.
+    pub visible: RECT,
+}
+
+/// The project cell's tree region in the current layout. `None` when the
+/// cell is scrolled out of view.
 pub fn project_body_rect(
     bounds: RECT,
     dpi: u32,
@@ -421,7 +435,7 @@ pub fn project_body_rect(
     scroll_y: i32,
     cols: i32,
     rows: i32,
-) -> Option<RECT> {
+) -> Option<ProjectBody> {
     let plan = plan(&bounds, dpi, sessions, cols, rows);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
     let cell = plan.visible_slot_rect(PROJECT_SLOT, scroll_y)?;
@@ -429,13 +443,18 @@ pub fn project_body_rect(
     if body.bottom <= body.top {
         return None;
     }
-    // Clip to the tile so a half-scrolled cell doesn't hand out rows that
-    // are painted outside the grid.
-    Some(RECT {
+    let visible = RECT {
         left: body.left,
         top: body.top.max(plan.layout.inner.top),
         right: body.right,
         bottom: body.bottom.min(plan.layout.inner.bottom),
+    };
+    if visible.bottom <= visible.top {
+        return None;
+    }
+    Some(ProjectBody {
+        bounds: body,
+        visible,
     })
 }
 
@@ -908,7 +927,10 @@ pub fn cursor_at(
             let Some(body) = project_body_rect(bounds, dpi, sessions, scroll_y, cols, rows) else {
                 return CursorHint::Arrow;
             };
-            return project_tree::cursor_at(x, y, body, dpi, nav, sessions);
+            if !point_in(&body.visible, x, y) {
+                return CursorHint::Arrow;
+            }
+            return project_tree::cursor_at(x, y, body.bounds, dpi, nav, sessions);
         }
     }
     if control_at(x, y, bounds, dpi, sessions, scroll_y, cols, rows).is_some() {
@@ -1020,7 +1042,10 @@ pub fn handle_lbutton_down_ex(
             let Some(body) = project_body_rect(bounds, dpi, sessions, scroll_y, cols, rows) else {
                 return GridClick::None;
             };
-            return match project_tree::handle_lbutton_down(x, y, body, dpi, nav, sessions) {
+            if !point_in(&body.visible, x, y) {
+                return GridClick::None;
+            }
+            return match project_tree::handle_lbutton_down(x, y, body.bounds, dpi, nav, sessions) {
                 Some(action) => GridClick::Action(action),
                 // Clicking the cell's chrome (title, padding) is a no-op
                 // rather than a fall-through — the grid owns the whole cell.
@@ -1063,6 +1088,41 @@ pub fn handle_lbutton_down_ex(
 
 fn point_in(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+/// The scroll offset that brings `id`'s cell fully into view, moving as
+/// little as possible — the offset is returned unchanged when the cell is
+/// already visible, or when the session has no cell at all. A cell taller
+/// than the viewport lands top-aligned.
+pub fn scroll_to_show(
+    bounds: RECT,
+    dpi: u32,
+    sessions: &Sessions,
+    scroll_y: i32,
+    cols: i32,
+    rows: i32,
+    id: SessionId,
+) -> i32 {
+    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let scroll_y = scroll_y.clamp(0, plan.max_scroll());
+    let Some(slot) = session_slot(sessions, id) else {
+        return scroll_y;
+    };
+    let virt = plan.slot_rect(slot);
+    let inner = &plan.layout.inner;
+    // The cell's gap comes along, so a cell scrolled to either edge keeps
+    // the same margin it has anywhere else in the grid.
+    let gap = plan.layout.gap;
+    let at_top = virt.top - gap - inner.top;
+    let at_bottom = virt.bottom + gap - inner.bottom;
+    let target = if scroll_y > at_top {
+        at_top
+    } else if scroll_y < at_bottom {
+        at_bottom
+    } else {
+        scroll_y
+    };
+    target.clamp(0, plan.max_scroll())
 }
 
 /// Convert a mouse-y position to the corresponding `scroll_y` while a
@@ -1267,9 +1327,14 @@ mod tests {
     /// Two sessions, laid out over a 3x2 grid: slot 1 and slot 2 flow into
     /// the two cells beside the project cell.
     fn two_sessions() -> Sessions {
+        dormant_sessions(2)
+    }
+
+    /// `n` dormant sessions, in flow order.
+    fn dormant_sessions(n: usize) -> Sessions {
         use windows::Win32::Foundation::HWND;
         let mut sessions = Sessions::new();
-        for i in 0..2 {
+        for i in 0..n {
             let view = crate::session_view::SessionView::new_dormant(
                 HWND::default(),
                 0,
@@ -1378,6 +1443,47 @@ mod tests {
         assert!(
             drag_placement(x, y, b, 96, &sessions, 0, 3, 2, id, GridHandle::Move, (0, 0)).is_none()
         );
+    }
+
+    /// The tree lays its rows out from the rect it was painted into, so a
+    /// half-scrolled project cell has to hand out that same rect — clipping
+    /// its top would shift every row away from where the click lands.
+    #[test]
+    fn the_project_body_keeps_the_origin_it_was_painted_at() {
+        let b = tile();
+        // Enough cells to overflow a 2x2 grid, so the tile can scroll.
+        let sessions = dormant_sessions(6);
+        let plan = plan(&b, 96, &sessions, 2, 2);
+        assert!(plan.max_scroll() > 0);
+
+        let scroll = 20;
+        let painted = project_body(&plan.visible_slot_rect(PROJECT_SLOT, scroll).unwrap(), 1.0);
+        let body = project_body_rect(b, 96, &sessions, scroll, 2, 2).unwrap();
+        assert_eq!(body.bounds.top, painted.top);
+        assert_eq!(body.bounds.bottom, painted.bottom);
+        // What's above the tile is still off limits — the grid paints
+        // something else there.
+        assert!(body.visible.top >= plan.layout.inner.top);
+    }
+
+    /// Ctrl+Tab can land on a cell in a row the grid has scrolled past;
+    /// the grid follows it, and stays put for a cell already in view.
+    #[test]
+    fn focusing_a_cell_scrolls_it_into_view() {
+        let b = tile();
+        let sessions = dormant_sessions(6);
+        let plan = plan(&b, 96, &sessions, 2, 2);
+        assert!(plan.max_scroll() > 0);
+
+        let last = sessions.iter().last().unwrap().id;
+        let scrolled = scroll_to_show(b, 96, &sessions, 0, 2, 2, last);
+        let cell = plan.visible_slot_rect(session_slot(&sessions, last).unwrap(), scrolled);
+        let cell = cell.expect("the focused cell is on screen");
+        assert!(cell.top >= plan.layout.inner.top);
+        assert!(cell.bottom <= plan.layout.inner.bottom);
+
+        let first = sessions.first_id().unwrap();
+        assert_eq!(scroll_to_show(b, 96, &sessions, 0, 2, 2, first), 0);
     }
 
     /// Points left of the first column belong to no cell — truncating
