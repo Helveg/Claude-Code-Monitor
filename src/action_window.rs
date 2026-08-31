@@ -593,7 +593,7 @@ impl Panel {
                 }
             }
             dashboard::TileAction::FocusSession(id) => {
-                self.set_focused_session(Some(id));
+                self.set_focused_session(Some(id), hwnd);
                 // Selecting a session is looking at it: it leaves the
                 // attention queue now rather than on the next recompute.
                 self.acknowledge(id);
@@ -669,7 +669,7 @@ impl Panel {
                 session.status_label.clear();
                 session.last_acknowledged_ms = crate::terminal::now_ms();
                 crate::claude_store::track(&session.session_id);
-                self.set_focused_session(Some(id));
+                self.set_focused_session(Some(id), hwnd);
                 self.recompute_layout(hwnd);
                 unsafe {
                     let _ = InvalidateRect(hwnd, None, false);
@@ -865,7 +865,7 @@ impl Panel {
         crate::claude_store::track(&session_id);
         let id = self.sessions.add(name, view, Some(cwd.clone()), session_id);
         self.expanded_projects.insert(cwd);
-        self.set_focused_session(Some(id));
+        self.set_focused_session(Some(id), hwnd);
         self.recompute_layout(hwnd);
         self.save_open_sessions();
         unsafe {
@@ -894,8 +894,12 @@ impl Panel {
         }
     }
 
-    fn set_focused_session(&mut self, id: Option<SessionId>) {
+    /// Focus a session, and in the grid bring its cell into view. The
+    /// callers all relayout right after, which is what picks up the scroll
+    /// offset this may have moved; `hwnd` supplies the DPI.
+    fn set_focused_session(&mut self, id: Option<SessionId>, hwnd: HWND) {
         self.focused_session = id;
+        self.scroll_focus_into_view(hwnd);
     }
 
     fn toggle_queue_mode(&mut self) {
@@ -909,20 +913,20 @@ impl Panel {
     /// looking at it now — so the flag and the pulse clear, and the next
     /// Ctrl+Tab moves on to whatever is still waiting. With nothing flagged
     /// this is a plain "next cell", wrapping at the end.
-    fn cycle_grid_focus(&mut self) -> bool {
+    fn cycle_grid_focus(&mut self, hwnd: HWND) -> bool {
         let ids: Vec<SessionId> = self.sessions.iter().map(|s| s.id).collect();
         let Some(next) = next_grid_focus(&self.attention_queue, &ids, self.focused_session) else {
             return false;
         };
-        self.focused_session = Some(next);
+        self.set_focused_session(Some(next), hwnd);
         self.acknowledge(next);
         true
     }
 
-    /// Bring the focused conversation's cell into view. Ctrl+Tab can land
-    /// on a cell the grid has scrolled past, and a focus you can't see
-    /// reads as nothing having happened. Returns `true` when the grid
-    /// actually moved.
+    /// Bring the focused conversation's cell into view. Ctrl+Tab, the nav
+    /// tree and the resume picker can all land on a cell the grid has
+    /// scrolled past, and a focus you can't see reads as nothing having
+    /// happened. Returns `true` when the grid actually moved.
     fn scroll_focus_into_view(&mut self, hwnd: HWND) -> bool {
         let (Some((rect, _, cols, rows)), Some(id)) =
             (self.grid_tile_layout(), self.focused_session)
@@ -2250,13 +2254,7 @@ unsafe extern "system" fn panel_wnd_proc(
                 if let Some(panel) = panel_guard.as_mut() {
                     let queue_len = panel.attention_queue.len();
                     let advanced = match panel.view {
-                        PanelView::Grid => {
-                            let advanced = panel.cycle_grid_focus();
-                            if advanced {
-                                panel.scroll_focus_into_view(hwnd);
-                            }
-                            advanced
-                        }
+                        PanelView::Grid => panel.cycle_grid_focus(hwnd),
                         PanelView::Dashboard { .. } => panel.cycle_attention_queue(),
                     };
                     if crate::diagnose::is_enabled() {
