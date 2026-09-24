@@ -33,6 +33,9 @@ pub struct NavState<'a> {
     /// Empty means the section isn't there at all.
     pub attention: &'a [AttentionRow],
     pub expanded: &'a HashSet<PathBuf>,
+    /// Projects showing their whole conversation history rather than the
+    /// most recent handful. Keyed by path, like [`Self::expanded`].
+    pub history_expanded: &'a HashSet<PathBuf>,
     pub scroll_y: i32,
     pub hovered: Option<NavTarget>,
     pub search: NavSearch<'a>,
@@ -89,6 +92,9 @@ pub enum TileAction {
     /// Collapse / expand a project in the nav tree, keyed by path so the
     /// state survives the scanner reordering the tree.
     ToggleProject(PathBuf),
+    /// Show a project's whole conversation history, or fold it back to the
+    /// most recent few.
+    ToggleHistory(PathBuf),
     /// Ask for a directory, then start a session in it — the nav's "New"
     /// badge. A project only exists once claude has run somewhere, so
     /// picking a folder and opening it are the same gesture.

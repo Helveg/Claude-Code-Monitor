@@ -16,7 +16,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_F4, VK_SPACE,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_F4, VK_RMENU,
+    VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -113,6 +114,10 @@ struct Panel {
     /// Projects the user has opened in the nav, keyed by path so the state
     /// survives the scanner reordering the tree.
     expanded_projects: HashSet<PathBuf>,
+    /// Projects whose conversation history is shown in full. A project opens
+    /// with only its most recent conversations; this is the ones the user
+    /// asked to see the rest of.
+    expanded_history: HashSet<PathBuf>,
     /// Vertical scroll offset of the nav tree, in device pixels.
     nav_scroll_y: i32,
     /// Nav row under the cursor. Drives the row wash and the `+` glyph's
@@ -413,6 +418,7 @@ pub fn open_panel() {
             nav_tree: Vec::new(),
             attention_rows: Vec::new(),
             expanded_projects,
+            expanded_history: HashSet::new(),
             nav_scroll_y: 0,
             hovered_nav: None,
             layout_cache: Vec::new(),
@@ -503,6 +509,7 @@ impl Panel {
             tree: &self.nav_tree,
             attention: &self.attention_rows,
             expanded: &self.expanded_projects,
+            history_expanded: &self.expanded_history,
             scroll_y: self.nav_scroll_y,
             hovered: self.hovered_nav,
             search: self.search.nav(),
@@ -639,8 +646,21 @@ impl Panel {
                 self.spawn_session(hwnd, &cwd, claude_cmd, session_id);
             }
             dashboard::TileAction::ToggleProject(path) => {
-                if !self.expanded_projects.remove(&path) {
+                if self.expanded_projects.remove(&path) {
+                    // Closing a project puts its history back to the recent
+                    // few, so reopening it is the short list again.
+                    self.expanded_history.remove(&path);
+                } else {
                     self.expanded_projects.insert(path);
+                }
+                self.recompute_layout(hwnd);
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            dashboard::TileAction::ToggleHistory(path) => {
+                if !self.expanded_history.remove(&path) {
+                    self.expanded_history.insert(path);
                 }
                 self.recompute_layout(hwnd);
                 unsafe {
@@ -2233,7 +2253,13 @@ unsafe extern "system" fn panel_wnd_proc(
             if alt_held && (vk == VK_F4.0 as u32 || vk == VK_SPACE.0 as u32) {
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
-            let ctrl_held = (GetKeyState(VK_CONTROL.0 as i32) as i16) < 0;
+            // Windows reports AltGr as left-Ctrl + right-Alt, so a bare
+            // GetKeyState(VK_CONTROL) is true for every AltGr combination —
+            // on a Belgian/German layout AltGr+= is `}` and AltGr+) is `]`.
+            // Those must reach the session as text, so an AltGr press is not
+            // a Ctrl press here. (No shortcut below wants real Ctrl+Alt.)
+            let altgr_held = (GetKeyState(VK_RMENU.0 as i32) as i16) < 0;
+            let ctrl_held = !altgr_held && (GetKeyState(VK_CONTROL.0 as i32) as i16) < 0;
             // Ctrl+Q toggles queue mode for the dashboard's main terminal.
             // 0x51 is the virtual-key code for the 'Q' letter.
             if ctrl_held && vk == 0x51 {

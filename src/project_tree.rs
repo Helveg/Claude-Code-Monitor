@@ -5,6 +5,7 @@
 //! ▾ Claude-Code-Monitor                    +
 //!   ● turn the nav into a project tree
 //!   ○ cleaned up terminal code
+//!   Show more conversations
 //! ▸ beehive                            24  +
 //! ```
 //!
@@ -13,7 +14,10 @@
 //! a session this manager is running — clicking it focuses its terminal. A
 //! hollow dot is a conversation from the transcript history — clicking it
 //! resumes it into a new terminal. The `+` on a project row starts a fresh
-//! session in that directory.
+//! session in that directory. Every live session is listed, but only the
+//! [`HISTORY_PREVIEW`] most recent conversations — the rest wait behind the
+//! "show more" row, so a directory with hundreds of transcripts still opens
+//! to something readable.
 //!
 //! The header band is pinned above the rows and never scrolls: `New` picks
 //! a directory the scanner hasn't seen, and the magnifier slides a filter
@@ -45,6 +49,10 @@ const CHEVRON_GAP: i32 = 8;
 /// Extra left offset for session rows, on top of the project row's own
 /// `PAD_X`, so children line up under their project's label.
 const CHILD_INDENT: i32 = 16;
+/// How many past conversations a project shows before the rest go behind
+/// the "show more" row. A busy project has hundreds of transcripts; the
+/// handful you touched last is what you actually reach for.
+const HISTORY_PREVIEW: usize = 5;
 const DOT_SIZE: i32 = 7;
 const DOT_GAP: i32 = 9;
 const PLUS_SIZE: i32 = 10;
@@ -99,6 +107,8 @@ pub enum NavTarget {
     Live(SessionId),
     /// A past conversation: `(project index, index into its history)`.
     History(usize, usize),
+    /// The "show more / fewer conversations" row under a project's history.
+    ShowMore(usize),
     /// A session in the "needs attention" section. Focuses the same session
     /// as its `Live` row; a target of its own so hovering one row doesn't
     /// light up both places the session appears.
@@ -141,6 +151,14 @@ enum RowKind<'a> {
         project: usize,
         index: usize,
         title: &'a str,
+    },
+    /// Tail of a project's history that is longer than [`HISTORY_PREVIEW`]:
+    /// the rest of it, one row you can open.
+    ShowMore {
+        project: usize,
+        /// True while the whole history is on show, so the row reads as the
+        /// way back rather than the way in.
+        expanded: bool,
     },
 }
 
@@ -210,12 +228,29 @@ fn rows<'a>(nav: &NavState<'a>, sessions: &Sessions) -> Vec<Row<'a>> {
                 height: SESSION_ROW_H,
             });
         }
-        for (hi, history) in node.history.iter().enumerate() {
+        // A filter is its own answer to "which conversations": every row
+        // that survived it is a hit, so none of them are hidden.
+        let history_open = filtering || nav.history_expanded.contains(&node.path);
+        let shown = if history_open {
+            node.history.len()
+        } else {
+            node.history.len().min(HISTORY_PREVIEW)
+        };
+        for (hi, history) in node.history.iter().take(shown).enumerate() {
             out.push(Row {
                 kind: RowKind::History {
                     project: pi,
                     index: hi,
                     title: history.title.as_str(),
+                },
+                height: SESSION_ROW_H,
+            });
+        }
+        if !filtering && node.history.len() > HISTORY_PREVIEW {
+            out.push(Row {
+                kind: RowKind::ShowMore {
+                    project: pi,
+                    expanded: history_open,
                 },
                 height: SESSION_ROW_H,
             });
@@ -476,6 +511,7 @@ pub fn target_at(
             }),
             RowKind::Live { id, .. } => Some(NavTarget::Live(id)),
             RowKind::History { project, index, .. } => Some(NavTarget::History(project, index)),
+            RowKind::ShowMore { project, .. } => Some(NavTarget::ShowMore(project)),
         };
     }
     None
@@ -524,6 +560,7 @@ pub fn action_for(target: NavTarget, tree: &[ProjectNode]) -> Option<TileAction>
                 session_id: history.session_id.clone(),
             })
         }
+        NavTarget::ShowMore(i) => Some(TileAction::ToggleHistory(tree.get(i)?.path.clone())),
         NavTarget::NewProject => Some(TileAction::PickNewProject),
         NavTarget::SearchToggle => Some(TileAction::ToggleSearch),
         // Clicking inside the open box is just "keep typing".
@@ -833,6 +870,36 @@ pub fn paint(
                     Color::from_hex(HISTORY_FG_HEX),
                     text_flags,
                 );
+                unsafe { SelectObject(hdc, old) };
+            }
+            RowKind::ShowMore { project, expanded } => {
+                let hovered = nav.hovered == Some(NavTarget::ShowMore(project));
+                if hovered {
+                    fill(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX));
+                }
+                // No dot: this row isn't a conversation. Its label starts
+                // where the conversation titles above it do, so the column
+                // of titles stays unbroken.
+                let label_rect = RECT {
+                    left: rect.left
+                        + pad_x
+                        + scaled(CHILD_INDENT + DOT_SIZE + DOT_GAP, dpi),
+                    top: rect.top,
+                    right: rect.right - pad_x,
+                    bottom: rect.bottom,
+                };
+                let color = if hovered {
+                    Color::from_hex(ORANGE_HEX)
+                } else {
+                    Color::from_hex(META_FG_HEX)
+                };
+                let label = if expanded {
+                    "Show fewer conversations"
+                } else {
+                    "Show more conversations"
+                };
+                let old = unsafe { SelectObject(hdc, session_font) };
+                draw_text(hdc, label, label_rect, color, text_flags);
                 unsafe { SelectObject(hdc, old) };
             }
         }
@@ -1257,6 +1324,11 @@ mod tests {
         }
     }
 
+    /// Every project's history folded to its preview, which is how a
+    /// project opens.
+    static EMPTY_PATHS: std::sync::LazyLock<HashSet<PathBuf>> =
+        std::sync::LazyLock::new(HashSet::new);
+
     /// Nav over a snapshot, with no filter and nothing hovered.
     fn nav_state<'a>(
         tree: &'a [ProjectNode],
@@ -1268,6 +1340,7 @@ mod tests {
             tree,
             attention,
             expanded,
+            history_expanded: &EMPTY_PATHS,
             scroll_y,
             hovered: None,
             search: NavSearch::default(),
@@ -1310,6 +1383,98 @@ mod tests {
         assert!(matches!(with[1].kind, RowKind::Attention { id: 1, .. }));
         assert!(matches!(with[2].kind, RowKind::Attention { id: 2, .. }));
         assert!(matches!(with[3].kind, RowKind::Project { index: 0, .. }));
+    }
+
+    /// The bug this fixes: opening a project with hundreds of transcripts
+    /// filled the tile with them. Only the most recent few come with it.
+    #[test]
+    fn a_long_history_is_folded_behind_the_show_more_row() {
+        let tree = vec![node("a", 2, 40)];
+        let sessions = Sessions::new();
+        let expanded: HashSet<PathBuf> = tree.iter().map(|n| n.path.clone()).collect();
+        let nav = nav_state(&tree, &[], &expanded, 0);
+
+        let preview = rows(&nav, &sessions);
+        // Project, both live sessions, five conversations, the row.
+        assert_eq!(preview.len(), 1 + 2 + HISTORY_PREVIEW + 1);
+        assert!(matches!(
+            preview.last().unwrap().kind,
+            RowKind::ShowMore {
+                project: 0,
+                expanded: false
+            }
+        ));
+        // It is the five most recent, in the scanner's order.
+        assert!(matches!(preview[3].kind, RowKind::History { index: 0, .. }));
+
+        // Opening it shows the lot, and the row turns into the way back.
+        let open: HashSet<PathBuf> = expanded.clone();
+        let mut nav = nav_state(&tree, &[], &expanded, 0);
+        nav.history_expanded = &open;
+        let all = rows(&nav, &sessions);
+        assert_eq!(all.len(), 1 + 2 + 40 + 1);
+        assert!(matches!(
+            all.last().unwrap().kind,
+            RowKind::ShowMore {
+                expanded: true,
+                ..
+            }
+        ));
+    }
+
+    /// A history that fits needs no row to ask for the rest of it.
+    #[test]
+    fn a_short_history_gets_no_show_more_row() {
+        let tree = vec![node("a", 0, HISTORY_PREVIEW)];
+        let sessions = Sessions::new();
+        let expanded: HashSet<PathBuf> = tree.iter().map(|n| n.path.clone()).collect();
+        let rows = rows(&nav_state(&tree, &[], &expanded, 0), &sessions);
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::ShowMore { .. })));
+    }
+
+    /// Filtering answers the same question the row does, so it overrides it:
+    /// every conversation that matched is a hit you asked to see.
+    #[test]
+    fn a_filter_shows_every_match_with_no_row() {
+        let tree = vec![node("a", 0, 40)];
+        let sessions = Sessions::new();
+        let expanded = HashSet::new();
+        let mut nav = nav_state(&tree, &[], &expanded, 0);
+        nav.search = NavSearch {
+            open: true,
+            query: "history",
+            anim: 1.0,
+        };
+        let rows = rows(&nav, &sessions);
+        assert_eq!(rows.len(), 1 + 40);
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::ShowMore { .. })));
+    }
+
+    /// Clicking the row is what opens the rest — the same path the project
+    /// row's own toggle takes, so the panel keys both on the project path.
+    #[test]
+    fn the_show_more_row_is_clickable() {
+        let bounds = tile();
+        let tree = vec![node("a", 0, 40)];
+        let sessions = Sessions::new();
+        let expanded: HashSet<PathBuf> = tree.iter().map(|n| n.path.clone()).collect();
+        let nav = nav_state(&tree, &[], &expanded, 0);
+
+        let y = HEADER_H + PAD_TOP + PROJECT_ROW_H
+            + SESSION_ROW_H * HISTORY_PREVIEW as i32
+            + SESSION_ROW_H / 2;
+        assert_eq!(
+            target_at(60, y, bounds, 96, &nav, &sessions),
+            Some(NavTarget::ShowMore(0))
+        );
+        assert!(matches!(
+            action_for(NavTarget::ShowMore(0), &tree),
+            Some(TileAction::ToggleHistory(p)) if p == tree[0].path
+        ));
     }
 
     /// A flagged session is clickable from the section and focuses the same
