@@ -87,6 +87,33 @@ fn palette_256(i: u8) -> (u8, u8, u8) {
     (scale(r), scale(g), scale(b))
 }
 
+/// xterm mouse-tracking protocol selected by the TUI via DECSET. `None`
+/// means no mouse events should be sent to the PTY at all — anything else
+/// means scroll wheel / clicks over the terminal should be encoded and
+/// forwarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseProtocol {
+    #[default]
+    None,
+    /// ?1000h — button press/release only.
+    Normal,
+    /// ?1002h — press/release plus drag motion.
+    ButtonEvent,
+    /// ?1003h — press/release plus all motion.
+    AnyEvent,
+}
+
+/// Encoding used for mouse event bytes. We only support the legacy
+/// (X10-style) framing and SGR — the others (URxvt 1015, utf-8 1005)
+/// add cost without buying us anything TUI authors actually rely on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseEncoding {
+    #[default]
+    Legacy,
+    /// ?1006h — `ESC [ < b ; x ; y M/m`, no 95-cell column cap.
+    Sgr,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellAttrs {
     pub fg: Option<AnsiColor>,
@@ -138,6 +165,13 @@ pub struct Grid {
     /// attached with smaller viewports, and the view should letterbox.
     /// `None` on owner-side or pre-handshake terminals.
     pub canonical: Option<(u16, u16, u32)>,
+    /// Mouse-tracking protocol the running TUI has requested. Drives whether
+    /// the host should encode WM_MOUSEWHEEL / button events and send them
+    /// through the PTY. `MouseProtocol::None` (default) means stay silent —
+    /// otherwise touchpad drivers fall back to fake arrow keys which trip
+    /// Claude Code's `arrow-burst` detector.
+    pub mouse_protocol: MouseProtocol,
+    pub mouse_encoding: MouseEncoding,
     saved_cursor: Option<(u16, u16, CellAttrs)>,
     /// VT100 deferred-wrap flag. After writing to the last column we leave the
     /// cursor on that column with `pending_wrap = true`; the wrap actually
@@ -189,6 +223,8 @@ impl Grid {
             scroll_bottom: rows.saturating_sub(1),
             current_attrs: CellAttrs::default(),
             canonical: None,
+            mouse_protocol: MouseProtocol::None,
+            mouse_encoding: MouseEncoding::Legacy,
             saved_cursor: None,
             pending_wrap: false,
             last_cursor_glyph_cell: None,
@@ -929,15 +965,49 @@ impl Parser {
                 1049 | 47 | 1047 => {
                     if enable && !self.using_alt {
                         let alt = mem::replace(grid, Grid::new(grid.cols, grid.rows));
+                        // Mouse mode is a property of the running TUI, not the
+                        // screen buffer — preserve it across the alt-screen swap
+                        // so wheel events keep flowing after the swap completes.
+                        grid.mouse_protocol = alt.mouse_protocol;
+                        grid.mouse_encoding = alt.mouse_encoding;
                         self.alt_grid = Some(alt);
                         self.using_alt = true;
                     } else if !enable && self.using_alt {
-                        if let Some(saved) = self.alt_grid.take() {
+                        let preserved_proto = grid.mouse_protocol;
+                        let preserved_enc = grid.mouse_encoding;
+                        if let Some(mut saved) = self.alt_grid.take() {
+                            saved.mouse_protocol = preserved_proto;
+                            saved.mouse_encoding = preserved_enc;
                             *grid = saved;
                         }
                         self.using_alt = false;
                     }
                 }
+                // ?1000 (Normal), ?1002 (ButtonEvent), ?1003 (AnyEvent) —
+                // xterm mouse-tracking protocols. The TUI requests one and
+                // we keep sending events at that level until it sends `l`.
+                1000 => {
+                    grid.mouse_protocol = if enable { MouseProtocol::Normal } else { MouseProtocol::None };
+                }
+                1002 => {
+                    grid.mouse_protocol = if enable { MouseProtocol::ButtonEvent } else { MouseProtocol::None };
+                }
+                1003 => {
+                    grid.mouse_protocol = if enable { MouseProtocol::AnyEvent } else { MouseProtocol::None };
+                }
+                // ?1006 — SGR mouse encoding. Lets us report column/row
+                // numbers >= 95 (legacy encoding caps at 223 columns after
+                // the 32 offset, and TUI-side parsing is simpler).
+                1006 => {
+                    grid.mouse_encoding = if enable { MouseEncoding::Sgr } else { MouseEncoding::Legacy };
+                }
+                // ?1007 — alternate-scroll: in alt-screen, terminal converts
+                // wheel to arrow keys. We never do that translation, so this
+                // is informational; we still accept the mode set so the TUI's
+                // DECRPM query (if it ever issues one) sees consistent state.
+                // We don't store it — our wheel handler simply forwards real
+                // mouse events when mouse_protocol is non-None.
+                1007 => {}
                 _ => {}
             }
         }
@@ -1494,5 +1564,44 @@ mod tests {
         assert_eq!(g.canonical, None);
         feed(&mut p, &mut g, b"\x1b]9001;wrong-subtag;80;24;1\x07");
         assert_eq!(g.canonical, None);
+    }
+
+    #[test]
+    fn mouse_tracking_dec_modes_round_trip() {
+        // ?1000 / ?1002 / ?1003 select the mouse-event protocol; ?1006
+        // switches to SGR encoding. We need to round-trip them so the
+        // host's wheel-forwarding decides correctly whether to emit a
+        // mouse event vs swallow the wheel.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b[?1000h");
+        assert_eq!(g.mouse_protocol, MouseProtocol::Normal);
+        feed(&mut p, &mut g, b"\x1b[?1002h");
+        assert_eq!(g.mouse_protocol, MouseProtocol::ButtonEvent);
+        feed(&mut p, &mut g, b"\x1b[?1003h");
+        assert_eq!(g.mouse_protocol, MouseProtocol::AnyEvent);
+        feed(&mut p, &mut g, b"\x1b[?1006h");
+        assert_eq!(g.mouse_encoding, MouseEncoding::Sgr);
+        feed(&mut p, &mut g, b"\x1b[?1006l");
+        assert_eq!(g.mouse_encoding, MouseEncoding::Legacy);
+        feed(&mut p, &mut g, b"\x1b[?1003l");
+        assert_eq!(g.mouse_protocol, MouseProtocol::None);
+    }
+
+    #[test]
+    fn mouse_mode_survives_alt_screen_swap() {
+        // TUIs request mouse tracking before flipping to the alt screen
+        // and expect it to keep working there. If we lost the mode on
+        // the buffer swap, scrolling inside the TUI would suddenly fall
+        // back to the wheel-into-arrow-keys path.
+        let mut p = Parser::new();
+        let mut g = Grid::new(20, 5);
+        feed(&mut p, &mut g, b"\x1b[?1000h\x1b[?1006h");
+        feed(&mut p, &mut g, b"\x1b[?1049h");
+        assert_eq!(g.mouse_protocol, MouseProtocol::Normal);
+        assert_eq!(g.mouse_encoding, MouseEncoding::Sgr);
+        feed(&mut p, &mut g, b"\x1b[?1049l");
+        assert_eq!(g.mouse_protocol, MouseProtocol::Normal);
+        assert_eq!(g.mouse_encoding, MouseEncoding::Sgr);
     }
 }

@@ -856,26 +856,41 @@ unsafe extern "system" fn panel_wnd_proc(
                     .iter()
                     .find(|(_, r)| point_in(r, pt.x, pt.y))
                     .map(|(tile, rect)| (tile.clone(), *rect));
-                if let Some((dashboard::Tile::SessionCardsGrid { include_orphans, .. }, rect)) =
-                    hit
-                {
-                    // 120 = WHEEL_DELTA. Translate to ~3 lines, ~card_h /
-                    // 4 per notch, but scaled by DPI.
-                    let scale = dpi as f64 / 96.0;
-                    let line_px = (40.0 * scale).round() as i32;
-                    let scroll_delta = -(delta * line_px) / 120;
-                    let new_scroll = cards_tile::clamp_scroll(
-                        rect,
-                        dpi,
-                        &panel.sessions,
-                        include_orphans,
-                        panel.cards_scroll_y + scroll_delta,
-                    );
-                    if new_scroll != panel.cards_scroll_y {
-                        panel.cards_scroll_y = new_scroll;
-                        panel.recompute_layout(hwnd);
-                        let _ = InvalidateRect(hwnd, None, false);
+                match hit {
+                    Some((tile @ dashboard::Tile::MainTerminal { .. }, _)) => {
+                        // Forward to the terminal as xterm mouse-wheel events
+                        // when the running TUI has enabled mouse tracking.
+                        // If it hasn't, we deliberately swallow the wheel
+                        // silently — sending arrow keys would trip Claude
+                        // Code's `arrow-burst` warning, and letting the
+                        // message fall through invites touchpad drivers to
+                        // synthesize their own VK_UP/VK_DOWN fallback.
+                        let notches = delta / 120;
+                        let _ = tile.handle_wheel(notches, pt.x, pt.y, &panel.sessions);
                     }
+                    Some((
+                        dashboard::Tile::SessionCardsGrid { include_orphans, .. },
+                        rect,
+                    )) => {
+                        // 120 = WHEEL_DELTA. Translate to ~3 lines, ~card_h /
+                        // 4 per notch, but scaled by DPI.
+                        let scale = dpi as f64 / 96.0;
+                        let line_px = (40.0 * scale).round() as i32;
+                        let scroll_delta = -(delta * line_px) / 120;
+                        let new_scroll = cards_tile::clamp_scroll(
+                            rect,
+                            dpi,
+                            &panel.sessions,
+                            include_orphans,
+                            panel.cards_scroll_y + scroll_delta,
+                        );
+                        if new_scroll != panel.cards_scroll_y {
+                            panel.cards_scroll_y = new_scroll;
+                            panel.recompute_layout(hwnd);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    _ => {}
                 }
             }
             LRESULT(0)
@@ -1023,6 +1038,16 @@ unsafe extern "system" fn panel_wnd_proc(
                 if let Some(panel) = panel_guard.as_mut() {
                     if panel.recompute_statuses() {
                         panel.recompute_layout(hwnd);
+                    }
+                    // Pull the latest canonical-size info each tick from the
+                    // registry and push it into each session's grid. Owner
+                    // shims publish this via the registry pipe because the
+                    // OSC-via-stdout path doesn't survive conhost's VT
+                    // processor on the way back to us.
+                    for s in panel.sessions.iter() {
+                        let value = crate::registry::canonical_for(&s.session_id)
+                            .map(|c| (c.cols, c.rows, c.sub_count));
+                        s.session_view.terminal().set_canonical(value);
                     }
                 }
                 // Always repaint on the 1 Hz tick: the sidebar /

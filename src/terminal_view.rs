@@ -177,6 +177,27 @@ impl TerminalView {
         self.terminal.as_ref().map(|t| t.grid.clone())
     }
 
+    /// Set the canonical post-merge size directly on the underlying grid,
+    /// bypassing the OSC parser. The owner shim pushes its canonical via
+    /// the manager's registry pipe (not via stdout) because conhost's VT
+    /// processor silently drops unknown OSCs on the way out of a ConPTY;
+    /// this is the entry point the panel uses to apply that pushed value
+    /// each paint tick. Returns whether the value actually changed.
+    pub fn set_canonical(&self, value: Option<(u16, u16, u32)>) -> bool {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+        let mut g = match terminal.grid.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if g.canonical == value {
+            return false;
+        }
+        g.canonical = value;
+        true
+    }
+
     pub fn last_output_ms(&self) -> u64 {
         self.terminal.as_ref().map(|t| t.last_output_ms()).unwrap_or(0)
     }
@@ -391,6 +412,54 @@ impl TerminalView {
         if let Some(t) = self.terminal.as_ref() {
             t.write_input(&bytes);
         }
+        true
+    }
+
+    /// Forward a vertical scroll-wheel notch to the PTY as an xterm mouse
+    /// event. `notches` is the WHEEL_DELTA-scaled count (positive = wheel-up,
+    /// negative = wheel-down); `x` and `y` are in host client coords.
+    ///
+    /// Returns true if the wheel event was consumed (the TUI has mouse
+    /// tracking enabled). Returns false when no tracking is on — the caller
+    /// can then fall back to UI-level scrolling. We deliberately never
+    /// synthesize arrow keys for wheel events: that's what Claude Code's
+    /// `arrow-burst` detector warns about, and it's lossy compared to real
+    /// mouse events.
+    pub fn handle_wheel(&self, notches: i32, x: i32, y: i32) -> bool {
+        if notches == 0 {
+            return false;
+        }
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+        let (protocol, encoding) = {
+            let g = match terminal.grid.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            (g.mouse_protocol, g.mouse_encoding)
+        };
+        if protocol == crate::terminal::MouseProtocol::None {
+            return false;
+        }
+        // Wheel-up is button 64; wheel-down is 65 in xterm's encoding.
+        let button = if notches > 0 { 64u32 } else { 65u32 };
+        // Cell coords are 1-based in both encodings. Outside the grid → no
+        // event (cursor was over padding or the title bar).
+        let (col, row) = match self.cell_at(x, y) {
+            Some((r, c)) => (c as u32 + 1, r as u32 + 1),
+            None => return false,
+        };
+        let one = encode_mouse_event(button, col, row, encoding);
+        // Multiple notches in one Windows message → multiple events. Cap
+        // generously so a runaway wheel can't flood the PTY but a fast
+        // flick still scrolls a screenful.
+        let repeats = notches.unsigned_abs().min(10);
+        let mut out: Vec<u8> = Vec::with_capacity(one.len() * repeats as usize);
+        for _ in 0..repeats {
+            out.extend_from_slice(&one);
+        }
+        terminal.write_input(&out);
         true
     }
 
@@ -964,6 +1033,36 @@ unsafe fn paste_clipboard_text(hwnd: HWND) -> Option<String> {
     result
 }
 
+/// Encode an xterm mouse event for the current encoding. `button` is the
+/// raw button code (0/1/2 for press, 3 for release in legacy; 64/65 for
+/// wheel-up/down; +32 for motion). `col` and `row` are 1-based cell coords.
+fn encode_mouse_event(
+    button: u32,
+    col: u32,
+    row: u32,
+    encoding: crate::terminal::MouseEncoding,
+) -> Vec<u8> {
+    use crate::terminal::MouseEncoding;
+    match encoding {
+        MouseEncoding::Sgr => {
+            // SGR: ESC [ < b ; x ; y M  (press / wheel) or m (release).
+            // Wheel events are conventionally framed with `M` regardless of
+            // direction — there's no separate release.
+            format!("\x1b[<{button};{col};{row}M").into_bytes()
+        }
+        MouseEncoding::Legacy => {
+            // Legacy X10: ESC [ M <b+32> <col+32> <row+32>.
+            // Bytes can be non-printable but must fit in u8 — cap fields at
+            // 223 (the encodable max). TUIs that asked for legacy already
+            // accept this lossy clamp.
+            let b = (button.min(223) + 32) as u8;
+            let c = (col.min(223) + 32) as u8;
+            let r = (row.min(223) + 32) as u8;
+            vec![0x1b, b'[', b'M', b, c, r]
+        }
+    }
+}
+
 /// Encode keystrokes that don't have a printable WM_CHAR equivalent. Plain
 /// Enter, Tab, Escape, and Backspace are intentionally excluded — TranslateMessage
 /// posts a WM_CHAR for them, which the host routes through `handle_char`.
@@ -995,5 +1094,35 @@ fn encode_key(vk: u32) -> Vec<u8> {
         v if v == VK_F11.0 as u32 => b"\x1b[23~".to_vec(),
         v if v == VK_F12.0 as u32 => b"\x1b[24~".to_vec(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::MouseEncoding;
+
+    #[test]
+    fn sgr_wheel_up_matches_xterm() {
+        // Wheel-up is button 64 with `M` as the final byte regardless
+        // of direction. Coords are 1-based. Claude Code's mouse decoder
+        // expects exactly this framing — any drift here and scroll-in-
+        // alt-screen breaks silently.
+        let bytes = encode_mouse_event(64, 5, 12, MouseEncoding::Sgr);
+        assert_eq!(bytes, b"\x1b[<64;5;12M");
+    }
+
+    #[test]
+    fn sgr_wheel_down_matches_xterm() {
+        let bytes = encode_mouse_event(65, 1, 1, MouseEncoding::Sgr);
+        assert_eq!(bytes, b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn legacy_encoding_offsets_by_32() {
+        // X10 framing: ESC [ M then three bytes (button, col, row) each
+        // shifted by 32. TUIs predating SGR rely on this exact framing.
+        let bytes = encode_mouse_event(0, 5, 7, MouseEncoding::Legacy);
+        assert_eq!(bytes, &[0x1b, b'[', b'M', 32, 37, 39]);
     }
 }

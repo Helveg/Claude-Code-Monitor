@@ -53,6 +53,20 @@ pub struct RegistryEntry {
     pub session_id: String,
     pub cwd: String,
     pub pid: u32,
+    /// Latest post-merge PTY size + subscriber count reported by an owner
+    /// shim. Side-channel for the canonical letterbox — we used to ship
+    /// this via OSC 9001 over the owner's stdout, but conhost ate the
+    /// sequence on its way back to the manager's terminal view. Pushed
+    /// on the registry connection instead so it bypasses VT processing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<CanonicalInfo>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalInfo {
+    pub cols: u16,
+    pub rows: u16,
+    pub sub_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +76,18 @@ struct RegisterMessage {
     session_id: String,
     cwd: String,
     pid: u32,
+}
+
+/// Post-register canonical-size push from an owner shim. Sent each time
+/// the merged PTY size or subscriber count changes — see
+/// `shim::owner::broadcast_canonical`.
+#[derive(Deserialize)]
+struct CanonicalUpdateMessage {
+    op: String,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+    sub_count: u32,
 }
 
 #[derive(Serialize)]
@@ -88,6 +114,16 @@ pub fn lookup(session_id: &str) -> Option<RegistryEntry> {
     let r = registry();
     let g = r.lock().unwrap_or_else(|p| p.into_inner());
     g.get(session_id).cloned()
+}
+
+/// Latest canonical-size info reported by an owner shim for the given
+/// session, or `None` if the shim hasn't pushed one yet (or the session
+/// isn't registered). Used by the manager's terminal view to letterbox
+/// the owner-side render in lockstep with the subscribers.
+pub fn canonical_for(session_id: &str) -> Option<CanonicalInfo> {
+    let r = registry();
+    let g = r.lock().unwrap_or_else(|p| p.into_inner());
+    g.get(session_id).and_then(|e| e.canonical)
 }
 
 /// Spawn the registry server thread. Idempotent — second-and-later calls
@@ -218,6 +254,7 @@ fn query_session_metadata(pipe_path: &str) -> Option<RegistryEntry> {
                             .get("pid")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0) as u32,
+                        canonical: None,
                     });
                 }
             }
@@ -301,8 +338,26 @@ fn handle_connection(h: HANDLE) {
         while let Some(nl) = accumulated.iter().position(|&b| b == b'\n') {
             let line_str = String::from_utf8_lossy(&accumulated[..nl]).into_owned();
             accumulated.drain(..=nl);
+            // Post-register messages: peek at `op` and route. Currently
+            // only `canonical_update` is defined — anything else is
+            // silently ignored to preserve forward compatibility.
             if registered_id.is_some() {
-                // v1: no further messages expected — silently ignore.
+                let id = registered_id.as_deref().unwrap();
+                if let Ok(msg) =
+                    serde_json::from_str::<CanonicalUpdateMessage>(&line_str)
+                {
+                    if msg.op == "canonical_update" && msg.session_id == id {
+                        let r = registry();
+                        let mut g = r.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(entry) = g.get_mut(id) {
+                            entry.canonical = Some(CanonicalInfo {
+                                cols: msg.cols,
+                                rows: msg.rows,
+                                sub_count: msg.sub_count,
+                            });
+                        }
+                    }
+                }
                 continue;
             }
             let msg: RegisterMessage = match serde_json::from_str(&line_str) {
@@ -316,6 +371,7 @@ fn handle_connection(h: HANDLE) {
                 session_id: msg.session_id.clone(),
                 cwd: msg.cwd,
                 pid: msg.pid,
+                canonical: None,
             };
             {
                 let r = registry();
@@ -361,6 +417,7 @@ mod tests {
             session_id: "8ffdc1f0-f702-4279-a906-505a49959ee3".into(),
             cwd: r"C:\Users\robin\Documents\git\Claude-Code-Monitor".into(),
             pid: 12345,
+            canonical: None,
         };
         let s = serde_json::to_string(&original).unwrap();
         let parsed: RegistryEntry = serde_json::from_str(&s).unwrap();

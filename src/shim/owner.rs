@@ -158,8 +158,12 @@ pub fn run(session_id: String, args: Vec<OsString>, real: PathBuf) -> ExitCode {
     TERMINAL_ALIVE.store(true, Ordering::Release);
 
     // Background thread keeps a heartbeat connection to the manager's
-    // registry pipe so the dashboard can list this session.
-    register_with_manager(session_id.clone());
+    // registry pipe so the dashboard can list this session. The returned
+    // shared cell publishes the pipe handle once registration completes —
+    // `broadcast_canonical` then pushes size updates over the same
+    // connection (the OSC-via-stdout path doesn't survive conhost's VT
+    // processor on the way back to the manager view).
+    let registry_handle = register_with_manager(session_id.clone());
 
     let subscribers: Arc<Mutex<HashMap<u64, Subscriber>>> = Arc::new(Mutex::new(HashMap::new()));
     let local_size = Arc::new(Mutex::new(initial_size));
@@ -217,10 +221,12 @@ pub fn run(session_id: String, args: Vec<OsString>, real: PathBuf) -> ExitCode {
         let nid = next_id.clone();
         let meta = meta.clone();
         let out_lock = stdout_lock.clone();
+        let reg_handle = registry_handle.clone();
+        let sid = session_id.clone();
         thread::spawn(move || {
             accept_loop(
                 meta, subs, lock, local_sz, nid, h_in_addr, hpc_addr, stdout_addr,
-                out_lock,
+                out_lock, reg_handle, sid,
             );
         });
     }
@@ -231,8 +237,12 @@ pub fn run(session_id: String, args: Vec<OsString>, real: PathBuf) -> ExitCode {
         let local_sz = local_size.clone();
         let alive = claude_alive.clone();
         let out_lock = stdout_lock.clone();
+        let reg_handle = registry_handle.clone();
+        let sid = session_id.clone();
         thread::spawn(move || {
-            local_size_watcher(local_sz, subs, hpc_addr, alive, stdout_addr, out_lock);
+            local_size_watcher(
+                local_sz, subs, hpc_addr, alive, stdout_addr, out_lock, reg_handle, sid,
+            );
         });
     }
 
@@ -387,6 +397,8 @@ fn accept_loop(
     hpc_addr: isize,
     stdout_addr: isize,
     stdout_lock: Arc<Mutex<()>>,
+    registry_handle: Arc<Mutex<Option<isize>>>,
+    session_id: String,
 ) {
     let pipe_path = protocol::session_pipe_name(&meta.session_id);
     let mut name_w: Vec<u16> = pipe_path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -446,10 +458,12 @@ fn accept_loop(
         let local_sz = local_size.clone();
         let meta = meta.clone();
         let out_lock = stdout_lock.clone();
+        let reg_handle = registry_handle.clone();
+        let sid = session_id.clone();
         thread::spawn(move || {
             subscriber_thread(
                 id, pipe_addr, out_rx, subs, lock, local_sz, h_in_addr, hpc_addr, meta,
-                stdout_addr, out_lock,
+                stdout_addr, out_lock, reg_handle, sid,
             );
         });
     }
@@ -467,6 +481,8 @@ fn subscriber_thread(
     meta: Arc<SessionMeta>,
     stdout_addr: isize,
     stdout_lock: Arc<Mutex<()>>,
+    registry_handle: Arc<Mutex<Option<isize>>>,
+    session_id: String,
 ) {
     util::shim_log(format!("owner: subscriber-thread {id} started"));
     let pipe = HANDLE(pipe_addr as *mut _);
@@ -602,6 +618,8 @@ fn subscriber_thread(
                                     sub_count,
                                     stdout_addr,
                                     &stdout_lock,
+                                    &registry_handle,
+                                    &session_id,
                                 );
                             }
                         }
@@ -637,6 +655,8 @@ fn subscriber_thread(
             sub_count,
             stdout_addr,
             &stdout_lock,
+            &registry_handle,
+            &session_id,
         );
     }
 }
@@ -680,6 +700,8 @@ fn local_size_watcher(
     claude_alive: Arc<AtomicBool>,
     stdout_addr: isize,
     stdout_lock: Arc<Mutex<()>>,
+    registry_handle: Arc<Mutex<Option<isize>>>,
+    session_id: String,
 ) {
     let mut last = current_console_size();
     while claude_alive.load(Ordering::Acquire) {
@@ -708,25 +730,26 @@ fn local_size_watcher(
                 sub_count,
                 stdout_addr,
                 &stdout_lock,
+                &registry_handle,
+                &session_id,
             );
         }
     }
 }
 
 /// Fan out the current canonical (post-merge) PTY size to every
-/// subscriber as a custom OSC frame, AND inject the same OSC into the
-/// owner's local stdout so the manager-side view hosting this owner
-/// updates its letterbox too. The widget on the other side parses the
-/// OSC out of the byte stream and uses it to letterbox regions outside
-/// the active grid. `sub_count` is the number of other clients sharing
-/// this session — purely informational, the widget uses it to label
-/// the constraint ("min of N").
+/// subscriber as a custom OSC frame, AND push a JSON `canonical_update`
+/// message through the manager registry pipe so the manager-side view
+/// hosting this owner updates its letterbox too. `sub_count` is the
+/// number of other clients sharing this session — purely informational,
+/// the widget uses it to label the constraint ("min of N").
 ///
-/// Format: `ESC ] 9001 ; ccmon-canonical ; <cols> ; <rows> ; <n> BEL`.
-/// Real terminals receiving this (e.g. the original session's console)
-/// drop unknown OSCs silently, so the local stdout write is a no-op
-/// there. The local write goes through `stdout_lock` so the OSC can't
-/// splice inside a half-written claude CSI from the fanout thread.
+/// The OSC channel (`ESC ] 9001 ; ccmon-canonical ; <cols> ; <rows> ;
+/// <n> BEL`) is still used for subscribers because their per-session
+/// pipe carries raw bytes that never pass through conhost's VT
+/// processor. The owner-side path used to do the same via the shim's
+/// stdout, but conhost silently drops unknown OSCs on the way back to
+/// the parent ConPTY — hence the dedicated registry side-channel.
 fn broadcast_canonical(
     subscribers: &Arc<Mutex<HashMap<u64, Subscriber>>>,
     cols: u16,
@@ -734,6 +757,8 @@ fn broadcast_canonical(
     sub_count: usize,
     stdout_addr: isize,
     stdout_lock: &Mutex<()>,
+    registry_handle: &Arc<Mutex<Option<isize>>>,
+    session_id: &str,
 ) {
     let body = format!("\x1b]9001;ccmon-canonical;{cols};{rows};{sub_count}\x07");
     let bytes = body.as_bytes();
@@ -749,9 +774,29 @@ fn broadcast_canonical(
         let _ = tx.send(frame.clone());
     }
 
+    // Owner-side path: a fresh foreign terminal (e.g. running the shim
+    // directly outside the manager) still gets the in-band OSC. Real
+    // terminals drop unknown OSCs silently so this is harmless there.
     {
         let _g = stdout_lock.lock().unwrap_or_else(|p| p.into_inner());
         let _ = write_all_h(HANDLE(stdout_addr as *mut _), bytes);
+    }
+
+    // Manager-side path: push the same info as JSON over the registry
+    // pipe. The manager's registry server stores it on the matching
+    // entry and the panel polls per paint to update each session's
+    // terminal view's `grid.canonical`.
+    let handle_addr = *registry_handle.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(addr) = handle_addr {
+        let msg = serde_json::json!({
+            "op": "canonical_update",
+            "session_id": session_id,
+            "cols": cols,
+            "rows": rows,
+            "sub_count": sub_count,
+        });
+        let line = format!("{msg}\n");
+        let _ = write_all_h(HANDLE(addr as *mut _), line.as_bytes());
     }
 }
 
@@ -788,9 +833,17 @@ fn write_all_h(h: HANDLE, mut data: &[u8]) -> bool {
     true
 }
 
-fn register_with_manager(session_id: String) {
+/// Returns a shared cell holding the registry-pipe HANDLE (stored as an
+/// `isize` so it crosses thread boundaries; HANDLE itself isn't `Send`)
+/// once the register/ack handshake has completed. `broadcast_canonical`
+/// reads from the cell to push `canonical_update` lines onto the same
+/// long-lived connection — bypasses ConPTY's VT processing, which
+/// silently dropped the OSC 9001 frames we used to ship via stdout.
+fn register_with_manager(session_id: String) -> Arc<Mutex<Option<isize>>> {
+    let handle: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
     let cwd = std::env::current_dir().unwrap_or_default();
     let pid = std::process::id();
+    let handle_for_thread = handle.clone();
     thread::spawn(move || {
         let Some(h) = connect_with_timeout(Duration::from_millis(500)) else {
             return;
@@ -802,7 +855,15 @@ fn register_with_manager(session_id: String) {
             "pid": pid,
         });
         let body = format!("{msg}\n");
-        let _ = write_all_h(h, body.as_bytes());
+        if !write_all_h(h, body.as_bytes()) {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            return;
+        }
+        // Publish the handle so canonical updates can ride on it.
+        *handle_for_thread.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(h.0 as isize);
         let mut buf = [0u8; 64];
         loop {
             let mut n: u32 = 0;
@@ -811,10 +872,14 @@ fn register_with_manager(session_id: String) {
                 break;
             }
         }
+        // Connection closed — clear the handle so broadcasters stop trying
+        // to write into a dead pipe.
+        *handle_for_thread.lock().unwrap_or_else(|p| p.into_inner()) = None;
         unsafe {
             let _ = CloseHandle(h);
         }
     });
+    handle
 }
 
 fn connect_with_timeout(timeout: Duration) -> Option<HANDLE> {

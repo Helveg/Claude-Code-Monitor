@@ -391,6 +391,25 @@ impl Tile {
         }
     }
 
+    /// Forward a scroll-wheel notch to the focused terminal when the tile
+    /// under the cursor is a `MainTerminal` with mouse tracking on. Returns
+    /// true when consumed; false lets the panel fall back to UI-level scroll
+    /// (cards grid). `notches` is the wheel delta divided by WHEEL_DELTA.
+    pub fn handle_wheel(
+        &self,
+        notches: i32,
+        x: i32,
+        y: i32,
+        sessions: &Sessions,
+    ) -> bool {
+        if let Tile::MainTerminal { session_id: Some(id), .. } = self {
+            if let Some(s) = sessions.get(*id) {
+                return s.session_view.terminal().handle_wheel(notches, x, y);
+            }
+        }
+        false
+    }
+
     /// Cursor hint for `(x, y)` (panel client coords) inside this tile's
     /// `bounds`. The panel sets the system cursor accordingly.
     pub fn cursor_at(
