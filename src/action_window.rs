@@ -118,6 +118,8 @@ struct Panel {
     /// with only its most recent conversations; this is the ones the user
     /// asked to see the rest of.
     expanded_history: HashSet<PathBuf>,
+    /// Projects the user removed from the nav, mirrored to settings.json.
+    hidden_projects: Vec<PathBuf>,
     /// Vertical scroll offset of the nav tree, in device pixels.
     nav_scroll_y: i32,
     /// Nav row under the cursor. Drives the row wash and the `+` glyph's
@@ -419,6 +421,7 @@ pub fn open_panel() {
             attention_rows: Vec::new(),
             expanded_projects,
             expanded_history: HashSet::new(),
+            hidden_projects: crate::window::saved_hidden_projects(),
             nav_scroll_y: 0,
             hovered_nav: None,
             layout_cache: Vec::new(),
@@ -460,7 +463,7 @@ impl Panel {
     fn recompute_layout(&mut self, hwnd: HWND) {
         let area = current_sessions_area(hwnd);
         let dpi = unsafe { GetDpiForWindow(hwnd).max(96) };
-        let tree = projects::build_tree(&self.projects, &self.sessions);
+        let tree = projects::build_tree(&self.projects, &self.sessions, &self.hidden_projects);
         // Flagged sessions are read off the whole tree: a filter narrows
         // what you're looking for, it shouldn't hide something asking for
         // you.
@@ -644,6 +647,22 @@ impl Panel {
                 // transcript, so the session keeps its original UUID.
                 let claude_cmd = resume_command(&session_id);
                 self.spawn_session(hwnd, &cwd, claude_cmd, session_id);
+            }
+            dashboard::TileAction::HideProject(path) => {
+                let key = projects::path_key(&path);
+                if !self.hidden_projects.iter().any(|p| projects::path_key(p) == key) {
+                    self.hidden_projects.push(path.clone());
+                    crate::window::set_saved_hidden_projects(self.hidden_projects.clone());
+                }
+                self.expanded_projects.remove(&path);
+                self.expanded_history.remove(&path);
+                // Indices shift under the cursor; the next mouse move finds
+                // whichever row slid into place.
+                self.hovered_nav = None;
+                self.recompute_layout(hwnd);
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             dashboard::TileAction::ToggleProject(path) => {
                 if self.expanded_projects.remove(&path) {
@@ -884,6 +903,13 @@ impl Panel {
         // wasn't handed.
         crate::claude_store::track(&session_id);
         let id = self.sessions.add(name, view, Some(cwd.clone()), session_id);
+        // Working in a removed project is asking for it back.
+        let key = projects::path_key(&cwd);
+        let before = self.hidden_projects.len();
+        self.hidden_projects.retain(|p| projects::path_key(p) != key);
+        if self.hidden_projects.len() != before {
+            crate::window::set_saved_hidden_projects(self.hidden_projects.clone());
+        }
         self.expanded_projects.insert(cwd);
         self.set_focused_session(Some(id), hwnd);
         self.recompute_layout(hwnd);

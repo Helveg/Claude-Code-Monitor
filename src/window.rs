@@ -102,6 +102,9 @@ struct AppState {
     /// for the same reason the grid size does: the panel is created and
     /// destroyed many times over a run, and this has to outlive it.
     open_sessions: Vec<SavedSession>,
+    /// Projects removed from the nav. The scanner still finds them; the nav
+    /// just leaves them out until a session is started there again.
+    hidden_projects: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +240,9 @@ struct SettingsFile {
     /// resume cards, never re-run on their own.
     #[serde(default)]
     sessions: Vec<SavedSession>,
+    /// Projects removed from the nav, by path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden_projects: Vec<PathBuf>,
 }
 
 impl Default for SettingsFile {
@@ -253,6 +259,7 @@ impl Default for SettingsFile {
             grid_rows: default_grid_rows(),
             font_pt: default_font_pt(),
             sessions: Vec::new(),
+            hidden_projects: Vec::new(),
         }
     }
 }
@@ -316,6 +323,7 @@ fn save_state_settings() {
             grid_rows: s.grid_rows,
             font_pt: s.font_pt,
             sessions: s.open_sessions.clone(),
+            hidden_projects: s.hidden_projects.clone(),
         });
     }
 }
@@ -369,6 +377,31 @@ pub fn set_saved_sessions(sessions: Vec<SavedSession>) {
             return;
         }
         s.open_sessions = sessions;
+    }
+    save_state_settings();
+}
+
+/// Projects the user has removed from the nav.
+pub fn saved_hidden_projects() -> Vec<PathBuf> {
+    let state = lock_state();
+    match state.as_ref() {
+        Some(s) => s.hidden_projects.clone(),
+        None => Vec::new(),
+    }
+}
+
+/// Remember which projects are removed from the nav. Writes settings.json
+/// only when the list actually changed.
+pub fn set_saved_hidden_projects(hidden: Vec<PathBuf>) {
+    {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        if s.hidden_projects == hidden {
+            return;
+        }
+        s.hidden_projects = hidden;
     }
     save_state_settings();
 }
@@ -1458,6 +1491,7 @@ pub fn run() {
                 grid_rows: settings.grid_rows.clamp(1, crate::grid_tile::MAX_GRID),
                 font_pt: crate::terminal_view::clamp_font_pt(settings.font_pt),
                 open_sessions: settings.sessions.clone(),
+                hidden_projects: settings.hidden_projects.clone(),
             });
         }
 

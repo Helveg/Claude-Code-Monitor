@@ -14,7 +14,8 @@
 //! a session this manager is running — clicking it focuses its terminal. A
 //! hollow dot is a conversation from the transcript history — clicking it
 //! resumes it into a new terminal. The `+` on a project row starts a fresh
-//! session in that directory. Every live session is listed, but only the
+//! session in that directory; hovering the row also shows a `×` beside it
+//! that removes the project from the nav. Every live session is listed, but only the
 //! [`HISTORY_PREVIEW`] most recent conversations — the rest wait behind the
 //! "show more" row, so a directory with hundreds of transcripts still opens
 //! to something readable.
@@ -61,6 +62,10 @@ const PLUS_STROKE: i32 = 2;
 /// is not a comfortable click target on its own.
 const PLUS_HIT_INFLATE: i32 = 7;
 const COUNT_GAP: i32 = 8;
+/// The `×` that removes a project: same box as the `+`, this far to its
+/// left. Wide enough that the `+`'s inflated hit region, which wins any
+/// overlap, doesn't swallow it.
+const REMOVE_GAP: i32 = 12;
 
 /// "New" badge: an outlined pill, no fill — the panel's controls are
 /// strokes and glyphs on the grey, never button chrome.
@@ -103,6 +108,8 @@ pub enum NavTarget {
     Project(usize),
     /// The `+` on a project row — start a session in that directory.
     NewSession(usize),
+    /// The `×` on a project row — remove it from the nav.
+    RemoveProject(usize),
     /// A running session.
     Live(SessionId),
     /// A past conversation: `(project index, index into its history)`.
@@ -138,6 +145,9 @@ enum RowKind<'a> {
         name: &'a str,
         expanded: bool,
         children: usize,
+        /// Whether the row offers its `×`. A project with sessions in the
+        /// workspace can't be removed: they would only bring it back.
+        removable: bool,
     },
     Live {
         id: SessionId,
@@ -208,6 +218,7 @@ fn rows<'a>(nav: &NavState<'a>, sessions: &Sessions) -> Vec<Row<'a>> {
                 name: node.name.as_str(),
                 expanded: is_expanded,
                 children: node.child_count(),
+                removable: node.live.is_empty(),
             },
             height: PROJECT_ROW_H,
         });
@@ -437,6 +448,17 @@ fn plus_rect(row: &RECT, dpi: u32) -> RECT {
     }
 }
 
+/// The `×` glyph's visual rect: the `+`'s box, shifted left of it.
+fn remove_rect(row: &RECT, dpi: u32) -> RECT {
+    let plus = plus_rect(row, dpi);
+    let shift = (plus.right - plus.left) + scaled(REMOVE_GAP, dpi);
+    RECT {
+        left: plus.left - shift,
+        right: plus.right - shift,
+        ..plus
+    }
+}
+
 fn inflate(rect: RECT, by: i32) -> RECT {
     RECT {
         left: rect.left - by,
@@ -501,10 +523,16 @@ pub fn target_at(
             // The section header is a label, not a control.
             RowKind::AttentionHeader { .. } => None,
             RowKind::Attention { id, .. } => Some(NavTarget::Attention(id)),
-            RowKind::Project { index, .. } => Some({
-                let plus = inflate(plus_rect(&rect, dpi), scaled(PLUS_HIT_INFLATE, dpi));
+            RowKind::Project {
+                index, removable, ..
+            } => Some({
+                let grow = scaled(PLUS_HIT_INFLATE, dpi);
+                let plus = inflate(plus_rect(&rect, dpi), grow);
+                let remove = inflate(remove_rect(&rect, dpi), grow);
                 if contains(&plus, x, y) {
                     NavTarget::NewSession(index)
+                } else if removable && contains(&remove, x, y) {
+                    NavTarget::RemoveProject(index)
                 } else {
                     NavTarget::Project(index)
                 }
@@ -551,6 +579,7 @@ pub fn action_for(target: NavTarget, tree: &[ProjectNode]) -> Option<TileAction>
     match target {
         NavTarget::Project(i) => Some(TileAction::ToggleProject(tree.get(i)?.path.clone())),
         NavTarget::NewSession(i) => Some(TileAction::NewSessionIn(tree.get(i)?.path.clone())),
+        NavTarget::RemoveProject(i) => Some(TileAction::HideProject(tree.get(i)?.path.clone())),
         NavTarget::Live(id) | NavTarget::Attention(id) => Some(TileAction::FocusSession(id)),
         NavTarget::History(pi, hi) => {
             let node = tree.get(pi)?;
@@ -754,11 +783,19 @@ pub fn paint(
                 name,
                 expanded,
                 children,
+                removable,
             } => {
                 let row_hovered = nav.hovered == Some(NavTarget::Project(index));
                 if row_hovered {
                     fill(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX));
                 }
+                // The `×` only shows while the cursor is somewhere on the
+                // row, so a resting nav isn't a column of delete buttons.
+                let anywhere_on_row = matches!(
+                    nav.hovered,
+                    Some(NavTarget::Project(i) | NavTarget::NewSession(i) | NavTarget::RemoveProject(i))
+                        if i == index
+                );
 
                 let chevron_size = scaled(CHEVRON_SIZE, dpi);
                 let chevron_x = rect.left + pad_x;
@@ -775,10 +812,18 @@ pub fn paint(
                 let plus_hovered = nav.hovered == Some(NavTarget::NewSession(index));
                 paint_plus(hdc, &plus, plus_hovered, dpi);
 
-                // Child count sits left of the `+`, and only when the
-                // project is collapsed — expanded, the rows speak for
+                let mut controls_left = plus.left;
+                if removable && anywhere_on_row {
+                    let remove = remove_rect(&rect, dpi);
+                    let remove_hovered = nav.hovered == Some(NavTarget::RemoveProject(index));
+                    paint_cross(hdc, &remove, remove_hovered, dpi);
+                    controls_left = remove.left;
+                }
+
+                // Child count sits left of the row's glyphs, and only when
+                // the project is collapsed — expanded, the rows speak for
                 // themselves.
-                let mut label_right = plus.left - scaled(COUNT_GAP, dpi);
+                let mut label_right = controls_left - scaled(COUNT_GAP, dpi);
                 if !expanded && children > 0 {
                     let count = children.to_string();
                     let old = unsafe { SelectObject(hdc, count_font) };
@@ -1239,6 +1284,35 @@ fn paint_plus(hdc: HDC, rect: &RECT, hovered: bool, dpi: u32) {
         },
         color,
     );
+}
+
+/// Two diagonal strokes, inset so the `×` reads as the same size as the
+/// `+` beside it (a diagonal spans more of its box than an upright arm).
+/// Orange while hovered, like the `+`.
+fn paint_cross(hdc: HDC, rect: &RECT, hovered: bool, dpi: u32) {
+    let color = if hovered {
+        Color::from_hex(ORANGE_HEX)
+    } else {
+        Color::from_hex(META_FG_HEX)
+    };
+    let stroke = scaled(PLUS_STROKE, dpi).max(1);
+    let inset = (rect.right - rect.left) / 8;
+    let (l, t, r, b) = (
+        rect.left + inset,
+        rect.top + inset,
+        rect.right - inset,
+        rect.bottom - inset,
+    );
+    unsafe {
+        let pen = CreatePen(PS_SOLID, stroke, COLORREF(color.to_colorref()));
+        let old_pen = SelectObject(hdc, pen);
+        let _ = MoveToEx(hdc, l, t, None);
+        let _ = LineTo(hdc, r, b);
+        let _ = MoveToEx(hdc, r, t, None);
+        let _ = LineTo(hdc, l, b);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen);
+    }
 }
 
 /// Session marker: filled for a running session, hollow for one that only
@@ -1764,6 +1838,47 @@ mod tests {
             Some(TileAction::ResumeSession { cwd, session_id })
                 if cwd == tree[0].path && session_id == "id-0"
         ));
+    }
+
+    /// The `×` sits left of the `+` and removes the project — but only on a
+    /// project with nothing in the workspace.
+    #[test]
+    fn the_cross_removes_an_idle_project() {
+        let bounds = tile();
+        let tree = vec![node("a", 0, 1), node("b", 1, 0)];
+        let expanded = HashSet::new();
+        let nav = nav_state(&tree, &[], &expanded, 0);
+        let sessions = Sessions::new();
+
+        let row = |i: i32| RECT {
+            left: bounds.left,
+            top: HEADER_H + PAD_TOP + PROJECT_ROW_H * i,
+            right: bounds.right,
+            bottom: HEADER_H + PAD_TOP + PROJECT_ROW_H * (i + 1),
+        };
+        let mid = |r: RECT| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+
+        let (x, y) = mid(remove_rect(&row(0), 96));
+        assert_eq!(
+            target_at(x, y, bounds, 96, &nav, &sessions),
+            Some(NavTarget::RemoveProject(0))
+        );
+        assert!(matches!(
+            action_for(NavTarget::RemoveProject(0), &tree),
+            Some(TileAction::HideProject(p)) if p == tree[0].path
+        ));
+        // The `+` keeps its own middle.
+        let (px, py) = mid(plus_rect(&row(0), 96));
+        assert_eq!(
+            target_at(px, py, bounds, 96, &nav, &sessions),
+            Some(NavTarget::NewSession(0))
+        );
+
+        let (x, y) = mid(remove_rect(&row(1), 96));
+        assert_eq!(
+            target_at(x, y, bounds, 96, &nav, &sessions),
+            Some(NavTarget::Project(1))
+        );
     }
 
     #[test]

@@ -89,6 +89,9 @@ pub enum TileAction {
     /// Spawn a terminal that resumes a past conversation (`--resume`) in
     /// the project it belongs to.
     ResumeSession { cwd: PathBuf, session_id: String },
+    /// Take a project out of the nav. Its transcripts stay on disk; starting
+    /// a session in the directory again brings it back.
+    HideProject(PathBuf),
     /// Collapse / expand a project in the nav tree, keyed by path so the
     /// state survives the scanner reordering the tree.
     ToggleProject(PathBuf),

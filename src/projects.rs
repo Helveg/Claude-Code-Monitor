@@ -19,7 +19,7 @@
 //! heads are cached by path because the fields we read from them (`cwd`,
 //! the opening prompt) are written once and never rewritten.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -371,7 +371,7 @@ fn short_id(session_id: &str) -> String {
 
 /// Comparison key for a path: separators normalized, case folded, no
 /// trailing separator. Windows treats all of those as the same directory.
-fn path_key(path: &Path) -> String {
+pub fn path_key(path: &Path) -> String {
     let s = path.to_string_lossy().replace('/', "\\");
     s.trim_end_matches('\\').to_lowercase()
 }
@@ -540,9 +540,15 @@ impl ProjectNode {
 /// spawned in a directory the scanner hasn't seen yet (no transcripts
 /// there) gets a project row of its own, slotted into the same name order
 /// as the rest.
-pub fn build_tree(projects: &[Project], sessions: &Sessions) -> Vec<ProjectNode> {
+///
+/// Projects in `hidden` are left out, history and all. A live session
+/// still brings its project back as a bare row of its own, so nothing the
+/// manager is running ever disappears from the nav.
+pub fn build_tree(projects: &[Project], sessions: &Sessions, hidden: &[PathBuf]) -> Vec<ProjectNode> {
+    let hidden: HashSet<String> = hidden.iter().map(|p| path_key(p)).collect();
     let mut nodes: Vec<ProjectNode> = projects
         .iter()
+        .filter(|p| !hidden.contains(&path_key(&p.path)))
         .map(|p| ProjectNode {
             path: p.path.clone(),
             name: p.name.clone(),
@@ -752,11 +758,24 @@ mod tests {
         );
         sessions.add("fix the queue", view, Some(cwd), "id-1".to_string());
 
-        let tree = build_tree(&[], &sessions);
+        let tree = build_tree(&[], &sessions, &[]);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].live.len(), 1);
         assert!(tree[0].live[0].dormant);
         assert!(attention_rows(&tree, &sessions).is_empty());
+    }
+
+    #[test]
+    fn a_hidden_project_is_left_out_of_the_tree() {
+        let projects = vec![
+            project("athena", "C:\\git\\athena", 1),
+            project("beehive", "C:\\git\\beehive", 1),
+        ];
+        let sessions = Sessions::new();
+        // Matched the way Windows matches paths: case and separators folded.
+        let tree = build_tree(&projects, &sessions, &[PathBuf::from("c:/GIT/beehive/")]);
+        let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["athena"]);
     }
 
     #[test]
