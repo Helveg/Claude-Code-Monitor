@@ -1,8 +1,9 @@
 //! The grid view's tile: a `cols x rows` grid of live terminals. Slot 0 is
-//! the project tree — the grid has no sidebar, so that cell is how sessions
-//! get started and resumed — and every live session follows in its own cell,
-//! rendered by the same [`SessionView`](crate::session_view::SessionView) the
-//! dashboard's main slot uses.
+//! the project tree — unless the user has docked it as a sidebar or
+//! collapsed it, in which case the slot is left out — and every live session
+//! follows in its own cell, rendered by the same
+//! [`SessionView`](crate::session_view::SessionView) the dashboard's main slot
+//! uses.
 //!
 //! Cells are equal-sized and stretched to fill the tile; the user picks
 //! `cols x rows` from the view button's right-click menu. More sessions than
@@ -159,6 +160,15 @@ impl GridPlacement {
     }
 }
 
+/// The grid the panel asks for: `cols x rows` cells, and whether the project
+/// list takes the first of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridShape {
+    pub cols: i32,
+    pub rows: i32,
+    pub nav_cell: bool,
+}
+
 /// Layout snapshot for one paint of the grid: column count + the stretched
 /// per-cell width / height / gap, plus the inner rect (the tile minus the
 /// scrollbar gutter). Computed once per paint and reused for hit-testing.
@@ -176,6 +186,9 @@ struct GridLayout {
 /// they were given; the rest flow into the cells left over.
 struct GridPlan {
     layout: GridLayout,
+    /// Whether `slots[0]` is on the board. Without the project cell it is a
+    /// placeholder that nothing paints, hit-tests or collides with.
+    nav_cell: bool,
     slots: Vec<GridPlacement>,
     /// Total content height at this arrangement, used for scrollbar thumb
     /// sizing and scroll clamping.
@@ -227,8 +240,15 @@ fn compute_grid_layout(bounds: &RECT, dpi: u32, cols: i32, rows_target: i32) -> 
 /// un-arranged grid look like the plain flow it always was. An arranged
 /// placement that collides with one already down is treated as un-arranged —
 /// the alternative is drawing two terminals on top of each other.
-fn resolve_slots(arranged: &[Option<GridPlacement>], cols: i32) -> Vec<GridPlacement> {
-    let mut taken: Vec<GridPlacement> = vec![GridPlacement::cell(0, 0)];
+fn resolve_slots(
+    arranged: &[Option<GridPlacement>],
+    cols: i32,
+    nav_cell: bool,
+) -> Vec<GridPlacement> {
+    let mut taken: Vec<GridPlacement> = Vec::new();
+    if nav_cell {
+        taken.push(GridPlacement::cell(0, 0));
+    }
     let mut slots: Vec<Option<GridPlacement>> = vec![None; arranged.len()];
 
     for (i, wanted) in arranged.iter().enumerate() {
@@ -291,12 +311,12 @@ fn build_plan(
     bounds: &RECT,
     dpi: u32,
     arranged: &[Option<GridPlacement>],
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> GridPlan {
-    let layout = compute_grid_layout(bounds, dpi, cols, rows);
-    let slots = resolve_slots(arranged, layout.cols);
-    let used_rows = slots.iter().map(|s| s.bottom()).max().unwrap_or(0);
+    let layout = compute_grid_layout(bounds, dpi, grid.cols, grid.rows);
+    let slots = resolve_slots(arranged, layout.cols, grid.nav_cell);
+    let skip = if grid.nav_cell { 0 } else { 1 };
+    let used_rows = slots.iter().skip(skip).map(|s| s.bottom()).max().unwrap_or(0);
     let content_h = if used_rows == 0 {
         0
     } else {
@@ -304,6 +324,7 @@ fn build_plan(
     };
     GridPlan {
         layout,
+        nav_cell: grid.nav_cell,
         slots,
         content_h,
     }
@@ -311,12 +332,21 @@ fn build_plan(
 
 /// The plan for the current session list — what every entry point here
 /// starts from.
-fn plan(bounds: &RECT, dpi: u32, sessions: &Sessions, cols: i32, rows: i32) -> GridPlan {
+fn plan(bounds: &RECT, dpi: u32, sessions: &Sessions, grid: GridShape) -> GridPlan {
     let arranged: Vec<Option<GridPlacement>> = sessions.iter().map(|s| s.placement).collect();
-    build_plan(bounds, dpi, &arranged, cols, rows)
+    build_plan(bounds, dpi, &arranged, grid)
 }
 
 impl GridPlan {
+    /// The project cell's on-screen rect, when the grid has one and it is
+    /// in view.
+    fn visible_nav_cell(&self, scroll_y: i32) -> Option<RECT> {
+        if !self.nav_cell {
+            return None;
+        }
+        self.visible_slot_rect(PROJECT_SLOT, scroll_y)
+    }
+
     /// Maximum legal scroll for this arrangement — `scroll_y` clamps to
     /// `[0, max_scroll]`. Zero when the content fits.
     fn max_scroll(&self) -> i32 {
@@ -434,12 +464,11 @@ pub fn project_body_rect(
     dpi: u32,
     sessions: &Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> Option<ProjectBody> {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
-    let cell = plan.visible_slot_rect(PROJECT_SLOT, scroll_y)?;
+    let cell = plan.visible_nav_cell(scroll_y)?;
     let body = project_body(&cell, dpi as f64 / 96.0);
     if body.bottom <= body.top {
         return None;
@@ -480,11 +509,10 @@ pub fn assign_bounds(
     dpi: u32,
     sessions: &mut Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
     font_pt: i32,
 ) {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
     let cell_pt = cell_font_pt(font_pt);
     for (i, session) in sessions.iter_mut().enumerate() {
@@ -506,10 +534,9 @@ pub fn resolved_placements(
     bounds: RECT,
     dpi: u32,
     sessions: &Sessions,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> Vec<GridPlacement> {
-    plan(&bounds, dpi, sessions, cols, rows).slots[1..].to_vec()
+    plan(&bounds, dpi, sessions, grid).slots[1..].to_vec()
 }
 
 pub fn paint(
@@ -520,8 +547,7 @@ pub fn paint(
     focused: Option<SessionId>,
     scroll_y: i32,
     nav: &NavState<'_>,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
     hovered_control: Option<(SessionId, SlotControl)>,
 ) {
     let panel_bg = Color::from_hex(PANEL_BG_HEX);
@@ -536,7 +562,7 @@ pub fn paint(
     let radius = (BORDER_RADIUS as f64 * scale).round().max(2.0) as i32;
 
     let cells: Vec<&Session> = sessions.iter().collect();
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
 
     // Clip cell rendering to the inner area so partially-visible rows at
@@ -560,7 +586,9 @@ pub fn paint(
             continue;
         };
         if slot == PROJECT_SLOT {
-            paint_project_cell(hdc, cell, dpi, scale, radius, nav, sessions, focused);
+            if plan.nav_cell {
+                paint_project_cell(hdc, cell, dpi, scale, radius, nav, sessions, focused);
+            }
             continue;
         }
         // The session paints itself into the bounds `assign_bounds` gave it,
@@ -690,11 +718,10 @@ pub fn session_at(
     dpi: u32,
     sessions: &Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> Option<SessionId> {
     let cells: Vec<&Session> = sessions.iter().collect();
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
     if !point_in(&plan.layout.inner, x, y) {
         return None;
@@ -763,11 +790,10 @@ pub fn handle_at(
     dpi: u32,
     sessions: &Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> Option<(SessionId, GridHandle)> {
     let cells: Vec<&Session> = sessions.iter().collect();
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
     if !point_in(&plan.layout.inner, x, y) {
         return None;
@@ -794,11 +820,10 @@ pub fn grab_offset(
     dpi: u32,
     sessions: &Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
     id: SessionId,
 ) -> (i32, i32) {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
     let Some(slot) = session_slot(sessions, id) else {
         return (0, 0);
@@ -824,13 +849,12 @@ pub fn drag_placement(
     dpi: u32,
     sessions: &Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
     id: SessionId,
     handle: GridHandle,
     grab: (i32, i32),
 ) -> Option<GridPlacement> {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
     let slot = session_slot(sessions, id)?;
     let current = plan.slots[slot];
@@ -858,7 +882,7 @@ pub fn drag_placement(
     }
     .clamped(plan.layout.cols);
 
-    if wanted.overlaps(&plan.slots[PROJECT_SLOT]) {
+    if plan.nav_cell && wanted.overlaps(&plan.slots[PROJECT_SLOT]) {
         return None;
     }
     Some(wanted)
@@ -875,10 +899,9 @@ pub fn control_at(
     dpi: u32,
     sessions: &Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> Option<(SessionId, SlotControl)> {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     if !point_in(&plan.layout.inner, x, y) {
         return None;
     }
@@ -891,7 +914,7 @@ pub fn control_at(
             return Some((session.id, SlotControl::FrameClose));
         }
     }
-    let id = session_at(x, y, bounds, dpi, sessions, scroll_y, cols, rows)?;
+    let id = session_at(x, y, bounds, dpi, sessions, scroll_y, grid)?;
     let session = sessions.get(id)?;
     if session.is_dormant() {
         let button = resume_card::button_at(x, y, session.session_view.bounds(), dpi)?;
@@ -914,10 +937,9 @@ pub fn cursor_at(
     sessions: &Sessions,
     scroll_y: i32,
     nav: &NavState<'_>,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> CursorHint {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let clamped = scroll_y.clamp(0, plan.max_scroll());
     if let Some((_, thumb)) = scrollbar_rects(&bounds, &plan, dpi, clamped) {
         if point_in(&thumb, x, y) {
@@ -927,9 +949,9 @@ pub fn cursor_at(
     if !point_in(&plan.layout.inner, x, y) {
         return CursorHint::Arrow;
     }
-    if let Some(cell) = plan.visible_slot_rect(PROJECT_SLOT, clamped) {
+    if let Some(cell) = plan.visible_nav_cell(clamped) {
         if point_in(&cell, x, y) {
-            let Some(body) = project_body_rect(bounds, dpi, sessions, scroll_y, cols, rows) else {
+            let Some(body) = project_body_rect(bounds, dpi, sessions, scroll_y, grid) else {
                 return CursorHint::Arrow;
             };
             if !point_in(&body.visible, x, y) {
@@ -938,13 +960,13 @@ pub fn cursor_at(
             return project_tree::cursor_at(x, y, body.bounds, dpi, nav, sessions);
         }
     }
-    if control_at(x, y, bounds, dpi, sessions, scroll_y, cols, rows).is_some() {
+    if control_at(x, y, bounds, dpi, sessions, scroll_y, grid).is_some() {
         return CursorHint::Hand;
     }
-    if let Some((_, handle)) = handle_at(x, y, bounds, dpi, sessions, scroll_y, cols, rows) {
+    if let Some((_, handle)) = handle_at(x, y, bounds, dpi, sessions, scroll_y, grid) {
         return handle.cursor();
     }
-    match session_at(x, y, bounds, dpi, sessions, scroll_y, cols, rows) {
+    match session_at(x, y, bounds, dpi, sessions, scroll_y, grid) {
         Some(id) => sessions
             .get(id)
             .map(|s| {
@@ -1000,10 +1022,9 @@ pub fn handle_lbutton_down(
     sessions: &Sessions,
     scroll_y: i32,
     nav: &NavState<'_>,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> Option<TileAction> {
-    match handle_lbutton_down_ex(x, y, bounds, dpi, sessions, scroll_y, nav, cols, rows) {
+    match handle_lbutton_down_ex(x, y, bounds, dpi, sessions, scroll_y, nav, grid) {
         GridClick::Action(action) => Some(action),
         _ => None,
     }
@@ -1019,10 +1040,9 @@ pub fn handle_lbutton_down_ex(
     sessions: &Sessions,
     scroll_y: i32,
     nav: &NavState<'_>,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> GridClick {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let clamped = scroll_y.clamp(0, plan.max_scroll());
     if let Some((track, thumb)) = scrollbar_rects(&bounds, &plan, dpi, clamped) {
         if point_in(&thumb, x, y) {
@@ -1042,9 +1062,9 @@ pub fn handle_lbutton_down_ex(
     if !point_in(&plan.layout.inner, x, y) {
         return GridClick::None;
     }
-    if let Some(cell) = plan.visible_slot_rect(PROJECT_SLOT, clamped) {
+    if let Some(cell) = plan.visible_nav_cell(clamped) {
         if point_in(&cell, x, y) {
-            let Some(body) = project_body_rect(bounds, dpi, sessions, scroll_y, cols, rows) else {
+            let Some(body) = project_body_rect(bounds, dpi, sessions, scroll_y, grid) else {
                 return GridClick::None;
             };
             if !point_in(&body.visible, x, y) {
@@ -1061,7 +1081,7 @@ pub fn handle_lbutton_down_ex(
     // The cell's own controls come before its terminal: the close cross
     // sits on the frame, and a restored session has buttons where the
     // terminal would be.
-    if let Some((id, control)) = control_at(x, y, bounds, dpi, sessions, scroll_y, cols, rows) {
+    if let Some((id, control)) = control_at(x, y, bounds, dpi, sessions, scroll_y, grid) {
         return GridClick::Action(match control {
             SlotControl::Resume => TileAction::ResumeDormant(id),
             SlotControl::Close | SlotControl::FrameClose => TileAction::CloseSession(id),
@@ -1069,13 +1089,13 @@ pub fn handle_lbutton_down_ex(
     }
     // Then the frame's edges — a press there arranges the cell rather than
     // reaching the terminal inside it.
-    if let Some((id, handle)) = handle_at(x, y, bounds, dpi, sessions, scroll_y, cols, rows) {
-        let grab = grab_offset(x, y, bounds, dpi, sessions, scroll_y, cols, rows, id);
+    if let Some((id, handle)) = handle_at(x, y, bounds, dpi, sessions, scroll_y, grid) {
+        let grab = grab_offset(x, y, bounds, dpi, sessions, scroll_y, grid, id);
         return GridClick::HandleGrab { id, handle, grab };
     }
     // A click in a terminal cell both selects that session for keyboard
     // input and anchors a selection drag in its grid.
-    match session_at(x, y, bounds, dpi, sessions, scroll_y, cols, rows) {
+    match session_at(x, y, bounds, dpi, sessions, scroll_y, grid) {
         Some(id) => {
             if let Some(s) = sessions.get(id) {
                 // Clicking the body of a dormant cell selects it without
@@ -1104,11 +1124,10 @@ pub fn scroll_to_show(
     dpi: u32,
     sessions: &Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
     id: SessionId,
 ) -> i32 {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     let scroll_y = scroll_y.clamp(0, plan.max_scroll());
     let Some(slot) = session_slot(sessions, id) else {
         return scroll_y;
@@ -1165,16 +1184,24 @@ pub fn clamp_scroll(
     dpi: u32,
     sessions: &Sessions,
     scroll_y: i32,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
 ) -> i32 {
-    let plan = plan(&bounds, dpi, sessions, cols, rows);
+    let plan = plan(&bounds, dpi, sessions, grid);
     scroll_y.clamp(0, plan.max_scroll())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `cols x rows` grid with the project list in its first cell.
+    fn shape(cols: i32, rows: i32) -> GridShape {
+        GridShape {
+            cols,
+            rows,
+            nav_cell: true,
+        }
+    }
 
     fn tile() -> RECT {
         RECT {
@@ -1223,8 +1250,8 @@ mod tests {
         let b = tile();
         // 2x2 asked for, 7 slots to place — the cell size is still the 2x2
         // one, and the overflow becomes scroll.
-        let two_by_two = build_plan(&b, 96, &flowing(3), 2, 2);
-        let overflowing = build_plan(&b, 96, &flowing(6), 2, 2);
+        let two_by_two = build_plan(&b, 96, &flowing(3), shape(2, 2));
+        let overflowing = build_plan(&b, 96, &flowing(6), shape(2, 2));
         assert_eq!(overflowing.layout.cell_h, two_by_two.layout.cell_h);
         assert!(overflowing.max_scroll() > 0);
         assert_eq!(two_by_two.max_scroll(), 0);
@@ -1249,7 +1276,7 @@ mod tests {
     /// first, then one session per cell, filling rows left to right.
     #[test]
     fn un_arranged_sessions_flow_in_order() {
-        let slots = resolve_slots(&flowing(4), 3);
+        let slots = resolve_slots(&flowing(4), 3, true);
         assert_eq!(slots[0], GridPlacement::cell(0, 0));
         assert_eq!(slots[1], GridPlacement::cell(1, 0));
         assert_eq!(slots[2], GridPlacement::cell(2, 0));
@@ -1263,7 +1290,7 @@ mod tests {
     fn arranged_sessions_hold_their_cell_and_the_rest_flow_around_them() {
         let mut arranged = flowing(3);
         arranged[2] = Some(GridPlacement::cell(1, 0));
-        let slots = resolve_slots(&arranged, 3);
+        let slots = resolve_slots(&arranged, 3, true);
         assert_eq!(slots[3], GridPlacement::cell(1, 0), "kept where it was put");
         assert_eq!(slots[1], GridPlacement::cell(2, 0));
         assert_eq!(slots[2], GridPlacement::cell(0, 1));
@@ -1280,12 +1307,12 @@ mod tests {
             cols: 2,
             rows: 2,
         });
-        let slots = resolve_slots(&arranged, 3);
+        let slots = resolve_slots(&arranged, 3, true);
         assert_eq!(slots[2], GridPlacement::cell(0, 1));
         assert_eq!(slots[3], GridPlacement::cell(0, 2));
 
         // …and the content is as tall as the lowest cell reaches.
-        let plan = build_plan(&tile(), 96, &arranged, 3, 2);
+        let plan = build_plan(&tile(), 96, &arranged, shape(3, 2));
         let used_rows = 3;
         assert_eq!(
             plan.content_h,
@@ -1304,7 +1331,7 @@ mod tests {
             cols: 3,
             rows: 1,
         });
-        let slots = resolve_slots(&arranged, 2);
+        let slots = resolve_slots(&arranged, 2, true);
         assert_eq!(
             slots[1],
             GridPlacement {
@@ -1324,7 +1351,7 @@ mod tests {
             Some(GridPlacement::cell(1, 0)),
             Some(GridPlacement::cell(1, 0)),
         ];
-        let slots = resolve_slots(&arranged, 3);
+        let slots = resolve_slots(&arranged, 3, true);
         assert_eq!(slots[1], GridPlacement::cell(1, 0));
         assert_eq!(slots[2], GridPlacement::cell(2, 0));
     }
@@ -1378,9 +1405,9 @@ mod tests {
 
         // Grabbed by its right-hand cell, so the origin trails the pointer
         // by one column the whole way.
-        let plan = build_plan(&b, 96, &[sessions.get(id).unwrap().placement, None], 3, 2);
+        let plan = build_plan(&b, 96, &[sessions.get(id).unwrap().placement, None], shape(3, 2));
         let (gx, gy) = point_in_cell(&plan, 2, 0);
-        let grab = grab_offset(gx, gy, b, 96, &sessions, 0, 3, 2, id);
+        let grab = grab_offset(gx, gy, b, 96, &sessions, 0, shape(3, 2), id);
         assert_eq!(grab, (1, 0));
 
         let (dx, dy) = point_in_cell(&plan, 1, 1);
@@ -1391,8 +1418,7 @@ mod tests {
             96,
             &sessions,
             0,
-            3,
-            2,
+            shape(3, 2),
             id,
             GridHandle::Move,
             grab,
@@ -1418,10 +1444,10 @@ mod tests {
         let id = sessions.first_id().unwrap();
         sessions.get_mut(id).unwrap().placement = Some(GridPlacement::cell(1, 0));
 
-        let plan = build_plan(&b, 96, &[sessions.get(id).unwrap().placement, None], 3, 2);
+        let plan = build_plan(&b, 96, &[sessions.get(id).unwrap().placement, None], shape(3, 2));
         let (x, y) = point_in_cell(&plan, 2, 1);
         let resized =
-            drag_placement(x, y, b, 96, &sessions, 0, 3, 2, id, GridHandle::ResizeCorner, (0, 0))
+            drag_placement(x, y, b, 96, &sessions, 0, shape(3, 2), id, GridHandle::ResizeCorner, (0, 0))
                 .expect("nothing in the way");
         assert_eq!(
             resized,
@@ -1443,10 +1469,35 @@ mod tests {
         let id = sessions.first_id().unwrap();
         sessions.get_mut(id).unwrap().placement = Some(GridPlacement::cell(1, 0));
 
-        let plan = build_plan(&b, 96, &[sessions.get(id).unwrap().placement, None], 3, 2);
+        let plan = build_plan(&b, 96, &[sessions.get(id).unwrap().placement, None], shape(3, 2));
         let (x, y) = point_in_cell(&plan, 0, 0);
         assert!(
-            drag_placement(x, y, b, 96, &sessions, 0, 3, 2, id, GridHandle::Move, (0, 0)).is_none()
+            drag_placement(x, y, b, 96, &sessions, 0, shape(3, 2), id, GridHandle::Move, (0, 0)).is_none()
+        );
+    }
+
+    /// With the project list docked elsewhere the corner is a cell like any
+    /// other: sessions flow into it, and a frame can be dropped there.
+    #[test]
+    fn without_the_project_cell_sessions_start_in_the_corner() {
+        let b = tile();
+        let docked = GridShape {
+            nav_cell: false,
+            ..shape(3, 2)
+        };
+        let slots = resolve_slots(&flowing(2), 3, false);
+        assert_eq!(slots[1], GridPlacement::cell(0, 0));
+        assert_eq!(slots[2], GridPlacement::cell(1, 0));
+
+        let mut sessions = two_sessions();
+        assert!(project_body_rect(b, 96, &sessions, 0, docked).is_none());
+        let id = sessions.first_id().unwrap();
+        sessions.get_mut(id).unwrap().placement = Some(GridPlacement::cell(1, 0));
+        let plan = build_plan(&b, 96, &[sessions.get(id).unwrap().placement, None], docked);
+        let (x, y) = point_in_cell(&plan, 0, 0);
+        assert_eq!(
+            drag_placement(x, y, b, 96, &sessions, 0, docked, id, GridHandle::Move, (0, 0)),
+            Some(GridPlacement::cell(0, 0))
         );
     }
 
@@ -1458,12 +1509,12 @@ mod tests {
         let b = tile();
         // Enough cells to overflow a 2x2 grid, so the tile can scroll.
         let sessions = dormant_sessions(6);
-        let plan = plan(&b, 96, &sessions, 2, 2);
+        let plan = plan(&b, 96, &sessions, shape(2, 2));
         assert!(plan.max_scroll() > 0);
 
         let scroll = 20;
         let painted = project_body(&plan.visible_slot_rect(PROJECT_SLOT, scroll).unwrap(), 1.0);
-        let body = project_body_rect(b, 96, &sessions, scroll, 2, 2).unwrap();
+        let body = project_body_rect(b, 96, &sessions, scroll, shape(2, 2)).unwrap();
         assert_eq!(body.bounds.top, painted.top);
         assert_eq!(body.bounds.bottom, painted.bottom);
         // What's above the tile is still off limits — the grid paints
@@ -1477,18 +1528,18 @@ mod tests {
     fn focusing_a_cell_scrolls_it_into_view() {
         let b = tile();
         let sessions = dormant_sessions(6);
-        let plan = plan(&b, 96, &sessions, 2, 2);
+        let plan = plan(&b, 96, &sessions, shape(2, 2));
         assert!(plan.max_scroll() > 0);
 
         let last = sessions.iter().last().unwrap().id;
-        let scrolled = scroll_to_show(b, 96, &sessions, 0, 2, 2, last);
+        let scrolled = scroll_to_show(b, 96, &sessions, 0, shape(2, 2), last);
         let cell = plan.visible_slot_rect(session_slot(&sessions, last).unwrap(), scrolled);
         let cell = cell.expect("the focused cell is on screen");
         assert!(cell.top >= plan.layout.inner.top);
         assert!(cell.bottom <= plan.layout.inner.bottom);
 
         let first = sessions.first_id().unwrap();
-        assert_eq!(scroll_to_show(b, 96, &sessions, 0, 2, 2, first), 0);
+        assert_eq!(scroll_to_show(b, 96, &sessions, 0, shape(2, 2), first), 0);
     }
 
     /// Points left of the first column belong to no cell — truncating
@@ -1506,7 +1557,7 @@ mod tests {
     #[test]
     fn a_point_inside_a_cell_reads_back_as_that_cell() {
         let b = tile();
-        let plan = build_plan(&b, 96, &flowing(5), 3, 2);
+        let plan = build_plan(&b, 96, &flowing(5), shape(3, 2));
         for slot in 0..plan.slots.len() {
             let rect = plan.slot_rect(slot);
             let p = plan.slots[slot];

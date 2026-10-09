@@ -96,6 +96,8 @@ struct AppState {
     /// `save_state_settings` has it to write.
     grid_cols: i32,
     grid_rows: i32,
+    /// Where the panel's project list sits, as last arranged.
+    nav_layout: crate::dashboard::NavLayout,
     /// Point size the panel's terminals render at, as last zoomed to.
     font_pt: i32,
     /// Sessions the panel had open the last time it was closed. Lives here
@@ -232,6 +234,10 @@ struct SettingsFile {
     grid_cols: i32,
     #[serde(default = "default_grid_rows")]
     grid_rows: i32,
+    /// Whether the project list is collapsed, and whether the grid view
+    /// shows it as a sidebar rather than in its first cell.
+    #[serde(default)]
+    nav_layout: crate::dashboard::NavLayout,
     /// Point size the dashboard's terminal renders at; the grid's cells
     /// follow it, one size smaller.
     #[serde(default = "default_font_pt")]
@@ -257,6 +263,7 @@ impl Default for SettingsFile {
             layout_tier: LayoutTier::default(),
             grid_cols: default_grid_cols(),
             grid_rows: default_grid_rows(),
+            nav_layout: Default::default(),
             font_pt: default_font_pt(),
             sessions: Vec::new(),
             hidden_projects: Vec::new(),
@@ -321,6 +328,7 @@ fn save_state_settings() {
             layout_tier: s.layout_tier,
             grid_cols: s.grid_cols,
             grid_rows: s.grid_rows,
+            nav_layout: s.nav_layout,
             font_pt: s.font_pt,
             sessions: s.open_sessions.clone(),
             hidden_projects: s.hidden_projects.clone(),
@@ -429,6 +437,28 @@ pub fn set_saved_grid_size(cols: i32, rows: i32) {
         }
         s.grid_cols = cols;
         s.grid_rows = rows;
+    }
+    save_state_settings();
+}
+
+/// Where the panel's project list should sit when it opens.
+pub fn saved_nav_layout() -> crate::dashboard::NavLayout {
+    let state = lock_state();
+    state.as_ref().map(|s| s.nav_layout).unwrap_or_default()
+}
+
+/// Remember how the project list was arranged. Written straight away, like
+/// the grid size.
+pub fn set_saved_nav_layout(layout: crate::dashboard::NavLayout) {
+    {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        if s.nav_layout == layout {
+            return;
+        }
+        s.nav_layout = layout;
     }
     save_state_settings();
 }
@@ -1489,6 +1519,7 @@ pub fn run() {
                 tooltip_hwnd: None,
                 grid_cols: settings.grid_cols.clamp(1, crate::grid_tile::MAX_GRID),
                 grid_rows: settings.grid_rows.clamp(1, crate::grid_tile::MAX_GRID),
+                nav_layout: settings.nav_layout,
                 font_pt: crate::terminal_view::clamp_font_pt(settings.font_pt),
                 open_sessions: settings.sessions.clone(),
                 hidden_projects: settings.hidden_projects.clone(),

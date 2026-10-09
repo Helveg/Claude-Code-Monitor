@@ -27,8 +27,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::dashboard::{self, NavState, PanelView};
-use crate::grid_tile::{self, MAX_GRID};
+use crate::dashboard::{self, NavLayout, NavState, PanelView};
+use crate::grid_tile::{self, GridShape, MAX_GRID};
 use crate::native_interop::{self, Color, UiFace};
 use crate::project_tree::{self, NavTarget};
 use crate::projects::{self, Project, ProjectNode};
@@ -59,8 +59,16 @@ const GLYPH_MAXIMIZE: char = '\u{E922}';
 const GLYPH_RESTORE: char = '\u{E923}';
 const GLYPH_CLOSE: char = '\u{E8BB}';
 
-/// App mark, name and the view tabs, left to right from the rail's edge.
-const BRAND_X: i32 = 14;
+/// The pane toggle in the caption's top-left corner: shows and hides the
+/// project list. Its glyph is the move it makes — the arrow points the way
+/// the pane will go.
+const PANE_BUTTON_W: i32 = 40;
+const PANE_GLYPH_PX: i32 = 14;
+const GLYPH_PANE_COLLAPSE: char = '\u{EA49}';
+const GLYPH_PANE_EXPAND: char = '\u{EA5B}';
+
+/// App mark, name and the view tabs, left to right after the pane toggle.
+const BRAND_X: i32 = 4;
 const BRAND_ICON: i32 = 16;
 const BRAND_ICON_GAP: i32 = 9;
 const BRAND_TAB_GAP: i32 = 22;
@@ -184,6 +192,9 @@ struct Panel {
     /// picker.
     grid_cols: i32,
     grid_rows: i32,
+    /// Where the project list sits: collapsed or not, and in the grid view a
+    /// cell or a sidebar. Mirrored to settings.json.
+    nav_layout: NavLayout,
     /// Present while the grid-size picker sheet is showing.
     grid_picker: Option<GridPicker>,
     /// True while the animation timer is running. It only runs when the grid
@@ -288,8 +299,7 @@ struct GridDrag {
     id: SessionId,
     handle: grid_tile::GridHandle,
     bounds: RECT,
-    cols: i32,
-    rows: i32,
+    grid: GridShape,
     /// Cell offset from the pointer to the cell's origin, which a move
     /// keeps constant so the frame doesn't jump under the cursor.
     grab: (i32, i32),
@@ -473,6 +483,7 @@ pub fn open_panel() {
             grid_drag: None,
             grid_cols,
             grid_rows,
+            nav_layout: crate::window::saved_nav_layout(),
             grid_picker: None,
             pulse_timer_on: false,
             search: SearchState::default(),
@@ -527,6 +538,7 @@ impl Panel {
             self.grid_scroll_y,
             self.grid_cols,
             self.grid_rows,
+            self.nav_layout,
             self.font_pt,
         );
         self.clamp_nav_scroll(dpi);
@@ -565,6 +577,30 @@ impl Panel {
             hovered: self.hovered_nav,
             armed_remove: self.armed_remove.as_deref(),
             search: self.search.nav(),
+            grid_dock: self.nav_layout.grid_dock(&self.view),
+        }
+    }
+
+    /// Rearrange the project list and write the new arrangement down. The
+    /// tree's scroll offset belongs to the rect it was laid out in, so a
+    /// move starts it back at the top.
+    fn set_nav_layout(&mut self, layout: NavLayout, hwnd: HWND) {
+        if layout == self.nav_layout {
+            return;
+        }
+        // A filter box that is about to disappear would keep taking the
+        // keyboard with nothing on screen to show for it.
+        if layout.collapsed && self.search.open {
+            self.set_search_open(false, hwnd);
+        }
+        self.nav_layout = layout;
+        self.nav_scroll_y = 0;
+        self.hovered_nav = None;
+        self.armed_remove = None;
+        crate::window::set_saved_nav_layout(layout);
+        self.recompute_layout(hwnd);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
         }
     }
 
@@ -574,14 +610,13 @@ impl Panel {
     fn nav_bounds(&self, dpi: u32) -> Option<RECT> {
         self.layout_cache.iter().find_map(|(tile, rect)| match tile {
             dashboard::Tile::ProjectTree => Some(*rect),
-            dashboard::Tile::SessionGrid { scroll_y, cols, rows } => {
+            dashboard::Tile::SessionGrid { scroll_y, grid } => {
                 grid_tile::project_body_rect(
                     *rect,
                     dpi,
                     &self.sessions,
                     *scroll_y,
-                    *cols,
-                    *rows,
+                    *grid,
                 )
                 .map(|body| body.bounds)
             }
@@ -755,6 +790,13 @@ impl Panel {
             dashboard::TileAction::ToggleSearch => {
                 self.set_search_open(!self.search.open, hwnd);
             }
+            dashboard::TileAction::ToggleGridDock => {
+                let layout = NavLayout {
+                    grid_sidebar: !self.nav_layout.grid_sidebar,
+                    ..self.nav_layout
+                };
+                self.set_nav_layout(layout, hwnd);
+            }
             dashboard::TileAction::ResumeDormant(id) => {
                 let Some(session) = self.sessions.get_mut(id) else {
                     return;
@@ -795,14 +837,10 @@ impl Panel {
     }
 
     /// The grid tile as the current layout has it: its rect, scroll offset
-    /// and grid size. `None` on the dashboard view, which has no grid.
-    fn grid_tile_layout(&self) -> Option<(RECT, i32, i32, i32)> {
+    /// and shape. `None` on the dashboard view, which has no grid.
+    fn grid_tile_layout(&self) -> Option<(RECT, i32, GridShape)> {
         self.layout_cache.iter().find_map(|(tile, rect)| match tile {
-            dashboard::Tile::SessionGrid {
-                scroll_y,
-                cols,
-                rows,
-            } => Some((*rect, *scroll_y, *cols, *rows)),
+            dashboard::Tile::SessionGrid { scroll_y, grid } => Some((*rect, *scroll_y, *grid)),
             _ => None,
         })
     }
@@ -812,10 +850,10 @@ impl Panel {
     /// around the one being dragged at every step, and the arrangement the
     /// user ends up looking at wouldn't be the one that gets written down.
     fn pin_placements(&mut self, dpi: u32) {
-        let Some((rect, _, cols, rows)) = self.grid_tile_layout() else {
+        let Some((rect, _, grid)) = self.grid_tile_layout() else {
             return;
         };
-        let resolved = grid_tile::resolved_placements(rect, dpi, &self.sessions, cols, rows);
+        let resolved = grid_tile::resolved_placements(rect, dpi, &self.sessions, grid);
         for (session, placement) in self.sessions.iter_mut().zip(resolved) {
             session.placement = Some(placement);
         }
@@ -872,8 +910,7 @@ impl Panel {
             dpi,
             &self.sessions,
             self.grid_scroll_y,
-            drag.cols,
-            drag.rows,
+            drag.grid,
             drag.id,
             drag.handle,
             drag.grab,
@@ -1031,7 +1068,7 @@ impl Panel {
     /// scrolled past, and a focus you can't see reads as nothing having
     /// happened. Returns `true` when the grid actually moved.
     fn scroll_focus_into_view(&mut self, hwnd: HWND) -> bool {
-        let (Some((rect, _, cols, rows)), Some(id)) =
+        let (Some((rect, _, grid)), Some(id)) =
             (self.grid_tile_layout(), self.focused_session)
         else {
             return false;
@@ -1042,8 +1079,7 @@ impl Panel {
             dpi,
             &self.sessions,
             self.grid_scroll_y,
-            cols,
-            rows,
+            grid,
             id,
         );
         if target == self.grid_scroll_y {
@@ -1416,6 +1452,7 @@ fn system_dpi_scale() -> f64 {
 /// A control in the caption rail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ChromeHit {
+    Pane,
     Close,
     Maximize,
     Minimize,
@@ -1484,9 +1521,20 @@ fn caption_button_rects(client: &RECT, dpi: u32) -> [RECT; 3] {
     rects
 }
 
+/// The pane toggle: the full caption height, flush in the top-left corner,
+/// mirroring the caption buttons on the right.
+fn pane_toggle_rect(client: &RECT, dpi: u32) -> RECT {
+    RECT {
+        left: client.left,
+        top: client.top,
+        right: client.left + px(PANE_BUTTON_W, dpi),
+        bottom: client.top + px(CAPTION_H, dpi),
+    }
+}
+
 fn brand_icon_rect(client: &RECT, dpi: u32) -> RECT {
     let size = px(BRAND_ICON, dpi);
-    let left = client.left + px(BRAND_X, dpi);
+    let left = pane_toggle_rect(client, dpi).right + px(BRAND_X, dpi);
     let top = client.top + (px(CAPTION_H, dpi) - size) / 2;
     RECT {
         left,
@@ -1561,6 +1609,9 @@ fn chrome_hit_at(client: &RECT, dpi: u32, x: i32, y: i32) -> Option<ChromeHit> {
     }
     if point_in(&minimize, x, y) {
         return Some(ChromeHit::Minimize);
+    }
+    if point_in(&pane_toggle_rect(client, dpi), x, y) {
+        return Some(ChromeHit::Pane);
     }
     tab_rects(client, dpi)
         .iter()
@@ -2050,6 +2101,17 @@ unsafe extern "system" fn panel_wnd_proc(
                     switch_view(hwnd, tab.view());
                     return LRESULT(0);
                 }
+                Some(ChromeHit::Pane) => {
+                    let mut panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(panel) = panel_guard.as_mut() {
+                        let layout = NavLayout {
+                            collapsed: !panel.nav_layout.collapsed,
+                            ..panel.nav_layout
+                        };
+                        panel.set_nav_layout(layout, hwnd);
+                    }
+                    return LRESULT(0);
+                }
                 Some(ChromeHit::Maximize) | None => {}
             }
             // Route to whichever tile contains the click. The grid tile is
@@ -2063,7 +2125,7 @@ unsafe extern "system" fn panel_wnd_proc(
                     .map(|(tile, rect)| (tile.clone(), *rect));
                 if let Some((tile, rect)) = hit {
                     match tile {
-                        dashboard::Tile::SessionGrid { scroll_y, cols, rows } => {
+                        dashboard::Tile::SessionGrid { scroll_y, grid } => {
                             let click = grid_tile::handle_lbutton_down_ex(
                                 x,
                                 y,
@@ -2072,8 +2134,7 @@ unsafe extern "system" fn panel_wnd_proc(
                                 &panel.sessions,
                                 scroll_y,
                                 &panel.nav(),
-                                cols,
-                                rows,
+                                grid,
                             );
                             match click {
                                 grid_tile::GridClick::Action(action) => {
@@ -2100,8 +2161,7 @@ unsafe extern "system" fn panel_wnd_proc(
                                         id,
                                         handle,
                                         bounds: rect,
-                                        cols,
-                                        rows,
+                                        grid,
                                         grab,
                                     });
                                     let _ = SetCapture(hwnd);
@@ -2116,8 +2176,7 @@ unsafe extern "system" fn panel_wnd_proc(
                                         dpi,
                                         &panel.sessions,
                                         panel.grid_scroll_y + delta,
-                                        cols,
-                                        rows,
+                                        grid,
                                     );
                                     panel.recompute_layout(hwnd);
                                     let _ = InvalidateRect(hwnd, None, false);
@@ -2222,14 +2281,13 @@ unsafe extern "system" fn panel_wnd_proc(
                         continue;
                     }
                     let tree_rect = match tile {
-                        dashboard::Tile::SessionGrid { scroll_y, cols, rows } => {
+                        dashboard::Tile::SessionGrid { scroll_y, grid } => {
                             grid_tile::project_body_rect(
                                 *rect,
                                 dpi,
                                 &panel.sessions,
                                 *scroll_y,
-                                *cols,
-                                *rows,
+                                *grid,
                             )
                             .filter(|body| point_in(&body.visible, x, y))
                             .map(|body| body.bounds)
@@ -2251,7 +2309,7 @@ unsafe extern "system" fn panel_wnd_proc(
                         continue;
                     }
                     control_hit = match tile {
-                        dashboard::Tile::SessionGrid { scroll_y, cols, rows } => {
+                        dashboard::Tile::SessionGrid { scroll_y, grid } => {
                             grid_tile::control_at(
                                 x,
                                 y,
@@ -2259,8 +2317,7 @@ unsafe extern "system" fn panel_wnd_proc(
                                 dpi,
                                 &panel.sessions,
                                 *scroll_y,
-                                *cols,
-                                *rows,
+                                *grid,
                             )
                         }
                         dashboard::Tile::MainTerminal {
@@ -2391,7 +2448,7 @@ unsafe extern "system" fn panel_wnd_proc(
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                     }
-                    Some((dashboard::Tile::SessionGrid { scroll_y, cols, rows }, rect)) => {
+                    Some((dashboard::Tile::SessionGrid { scroll_y, grid }, rect)) => {
                         let scale = dpi as f64 / 96.0;
                         // Over the project cell the wheel belongs to the
                         // tree, exactly as it does in the sidebar.
@@ -2400,8 +2457,7 @@ unsafe extern "system" fn panel_wnd_proc(
                             dpi,
                             &panel.sessions,
                             scroll_y,
-                            cols,
-                            rows,
+                            grid,
                         )
                         .filter(|body| point_in(&body.visible, pt.x, pt.y))
                         .map(|body| body.bounds);
@@ -2435,8 +2491,7 @@ unsafe extern "system" fn panel_wnd_proc(
                             dpi,
                             &panel.sessions,
                             scroll_y,
-                            cols,
-                            rows,
+                            grid,
                         )
                         .and_then(|id| panel.sessions.get(id));
                         if let Some(session) = over_terminal.filter(|_| !shift) {
@@ -2458,8 +2513,7 @@ unsafe extern "system" fn panel_wnd_proc(
                             dpi,
                             &panel.sessions,
                             panel.grid_scroll_y + scroll_delta,
-                            cols,
-                            rows,
+                            grid,
                         );
                         if new_scroll != panel.grid_scroll_y {
                             panel.grid_scroll_y = new_scroll;
@@ -2489,7 +2543,15 @@ unsafe extern "system" fn panel_wnd_proc(
             {
                 let panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(panel) = panel_guard.as_ref() {
-                    paint_caption(mem_dc, &client, dpi, hwnd, &panel.view, panel.hovered_chrome);
+                    paint_caption(
+                        mem_dc,
+                        &client,
+                        dpi,
+                        hwnd,
+                        &panel.view,
+                        panel.nav_layout.collapsed,
+                        panel.hovered_chrome,
+                    );
                     let nav = panel.nav();
                     for (tile, rect) in &panel.layout_cache {
                         tile.paint(
@@ -3096,8 +3158,8 @@ fn draw_line(hdc: HDC, text: &str, rect: RECT, color: Color, flags: DRAW_TEXT_FO
     }
 }
 
-/// Everything in the caption rail: app mark and name, the view tabs, the
-/// quota gauges and the caption buttons. Glyphs and text only — hover
+/// Everything in the caption rail: the pane toggle, app mark and name, the
+/// view tabs, the quota gauges and the caption buttons. Glyphs and text only — hover
 /// lights a control's ink, it never grows a fill.
 fn paint_caption(
     hdc: HDC,
@@ -3105,6 +3167,7 @@ fn paint_caption(
     dpi: u32,
     hwnd: HWND,
     view: &PanelView,
+    nav_collapsed: bool,
     hovered: Option<ChromeHit>,
 ) {
     let active = PANEL_ACTIVE.load(Ordering::Relaxed);
@@ -3115,6 +3178,20 @@ fn paint_caption(
 
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
+
+        let pane_glyph = if nav_collapsed {
+            GLYPH_PANE_EXPAND
+        } else {
+            GLYPH_PANE_COLLAPSE
+        };
+        let pane_color = if hovered == Some(ChromeHit::Pane) { ink } else { muted };
+        native_interop::draw_glyph(
+            hdc,
+            pane_glyph,
+            pane_toggle_rect(client, dpi),
+            px(PANE_GLYPH_PX, dpi),
+            pane_color,
+        );
 
         let icon = brand_icon_rect(client, dpi);
         let size = icon.right - icon.left;

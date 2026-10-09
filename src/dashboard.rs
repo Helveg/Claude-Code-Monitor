@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::HDC;
 
-use crate::grid_tile;
+use crate::grid_tile::{self, GridShape};
 use crate::project_tree::{self, NavTarget};
 use crate::projects::{AttentionRow, ProjectNode};
 use crate::resume_card::{self, CardButton};
@@ -42,6 +42,59 @@ pub struct NavState<'a> {
     /// showing its "Remove?" confirmation.
     pub armed_remove: Option<&'a Path>,
     pub search: NavSearch<'a>,
+    /// Where the grid view keeps the tree, which the header's dock control
+    /// swaps. `None` outside the grid, where the tree is always a sidebar.
+    pub grid_dock: Option<GridDock>,
+}
+
+/// Where the grid view keeps the project list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridDock {
+    /// The grid's first cell.
+    Cell,
+    /// A sidebar beside the grid, as in the focus view.
+    Sidebar,
+}
+
+/// How the user has arranged the project list, written to settings.json.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NavLayout {
+    /// Hidden in every view, until the caption's pane toggle brings it back.
+    #[serde(default)]
+    pub collapsed: bool,
+    /// The grid view shows the list as a sidebar instead of its first cell.
+    #[serde(default)]
+    pub grid_sidebar: bool,
+}
+
+/// Where the project list ends up in one view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavPlacement {
+    Sidebar,
+    GridCell,
+    Hidden,
+}
+
+impl NavLayout {
+    pub fn placement(self, view: &PanelView) -> NavPlacement {
+        if self.collapsed {
+            return NavPlacement::Hidden;
+        }
+        match view {
+            PanelView::Grid if !self.grid_sidebar => NavPlacement::GridCell,
+            _ => NavPlacement::Sidebar,
+        }
+    }
+
+    /// The grid's dock state, for the tree header's control. `None` outside
+    /// the grid view.
+    pub fn grid_dock(self, view: &PanelView) -> Option<GridDock> {
+        match view {
+            PanelView::Grid if self.grid_sidebar => Some(GridDock::Sidebar),
+            PanelView::Grid => Some(GridDock::Cell),
+            PanelView::Dashboard { .. } => None,
+        }
+    }
 }
 
 /// State of the nav header's filter box.
@@ -68,15 +121,12 @@ pub enum Tile {
     /// Tree of projects, each expanding to its live sessions and past
     /// conversations, with a `+` per project to start a new one.
     ProjectTree,
-    /// `cols x rows` grid of live terminals: the project list occupies the
-    /// first cell, then one terminal per session. `scroll_y` shifts the
-    /// rendered cell rows up by that many pixels — the panel feeds in the
-    /// current scroll offset so the same cache survives across paints.
-    SessionGrid {
-        scroll_y: i32,
-        cols: i32,
-        rows: i32,
-    },
+    /// `cols x rows` grid of live terminals, one per session — after the
+    /// project list, when `grid.nav_cell` gives it the first cell.
+    /// `scroll_y` shifts the rendered cell rows up by that many pixels — the
+    /// panel feeds in the current scroll offset so the same cache survives
+    /// across paints.
+    SessionGrid { scroll_y: i32, grid: GridShape },
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +160,9 @@ pub enum TileAction {
     PickNewProject,
     /// Open or close the nav's filter box.
     ToggleSearch,
+    /// Move the grid view's project list between its first cell and a
+    /// sidebar.
+    ToggleGridDock,
     /// Start a restored session's conversation back up, in the slot it
     /// already occupies.
     ResumeDormant(SessionId),
@@ -167,14 +220,30 @@ pub enum CursorHint {
 pub enum PanelView {
     /// Default: project sidebar on the left, main terminal filling the rest.
     Dashboard { queue_mode: bool },
-    /// Grid of live terminals over the whole panel. The project list is the
-    /// grid's first cell, so this view needs no sidebar of its own.
+    /// Grid of live terminals. The project list takes the grid's first cell
+    /// or sits beside it as a sidebar, per [`NavLayout::grid_sidebar`].
     Grid,
 }
 
 /// Layout constants in design pixels at 96 DPI.
 const SIDEBAR_WIDTH: i32 = 220;
 const TILE_GAP: i32 = 8;
+
+/// The sidebar's rect, and what is left of `panel` beside it once `gap` is
+/// taken out between the two.
+fn split_sidebar(panel: RECT, dpi: u32, gap: i32) -> (RECT, RECT) {
+    let scale = dpi as f64 / 96.0;
+    let sidebar_w = (SIDEBAR_WIDTH as f64 * scale).round() as i32;
+    let sidebar = RECT {
+        right: panel.left + sidebar_w,
+        ..panel
+    };
+    let rest = RECT {
+        left: sidebar.right + gap,
+        ..panel
+    };
+    (sidebar, rest)
+}
 
 /// Build the tile list for the current view. Also writes the assigned bounds
 /// into each session's `SessionView` so subsequent paint calls (which read
@@ -189,27 +258,21 @@ pub fn layout(
     grid_scroll_y: i32,
     grid_cols: i32,
     grid_rows: i32,
+    nav_layout: NavLayout,
     font_pt: i32,
 ) -> Vec<(Tile, RECT)> {
     let mut tiles: Vec<(Tile, RECT)> = Vec::new();
+    let placement = nav_layout.placement(view);
 
     match view {
         PanelView::Dashboard { queue_mode } => {
-            let scale = dpi as f64 / 96.0;
-            let sidebar_w = (SIDEBAR_WIDTH as f64 * scale).round() as i32;
-            let gap = (TILE_GAP as f64 * scale).round() as i32;
-
-            let sidebar = RECT {
-                left: panel.left,
-                top: panel.top,
-                right: panel.left + sidebar_w,
-                bottom: panel.bottom,
-            };
-            let main = RECT {
-                left: sidebar.right + gap,
-                top: panel.top,
-                right: panel.right,
-                bottom: panel.bottom,
+            let gap = (TILE_GAP as f64 * dpi as f64 / 96.0).round() as i32;
+            let main = if placement == NavPlacement::Sidebar {
+                let (sidebar, main) = split_sidebar(panel, dpi, gap);
+                tiles.push((Tile::ProjectTree, sidebar));
+                main
+            } else {
+                panel
             };
 
             // In queue mode the main terminal follows the front of the
@@ -224,7 +287,6 @@ pub fn layout(
             } else {
                 focused_session.or_else(|| sessions.first_id())
             };
-            tiles.push((Tile::ProjectTree, sidebar));
             tiles.push((
                 Tile::MainTerminal {
                     session_id,
@@ -234,13 +296,25 @@ pub fn layout(
             ));
         }
         PanelView::Grid => {
+            // The grid pads its cells with a gap of its own, so it starts
+            // right at the sidebar's edge.
+            let cells = if placement == NavPlacement::Sidebar {
+                let (sidebar, cells) = split_sidebar(panel, dpi, 0);
+                tiles.push((Tile::ProjectTree, sidebar));
+                cells
+            } else {
+                panel
+            };
             tiles.push((
                 Tile::SessionGrid {
                     scroll_y: grid_scroll_y,
-                    cols: grid_cols,
-                    rows: grid_rows,
+                    grid: GridShape {
+                        cols: grid_cols,
+                        rows: grid_rows,
+                        nav_cell: placement == NavPlacement::GridCell,
+                    },
                 },
-                panel,
+                cells,
             ));
         }
     }
@@ -264,10 +338,8 @@ fn apply_bounds(tiles: &[(Tile, RECT)], dpi: u32, sessions: &mut Sessions, font_
                     s.session_view.set_bounds(*rect, dpi, font_pt);
                 }
             }
-            Tile::SessionGrid { scroll_y, cols, rows } => {
-                grid_tile::assign_bounds(
-                    *rect, dpi, sessions, *scroll_y, *cols, *rows, font_pt,
-                );
+            Tile::SessionGrid { scroll_y, grid } => {
+                grid_tile::assign_bounds(*rect, dpi, sessions, *scroll_y, *grid, font_pt);
             }
             Tile::ProjectTree => {}
         }
@@ -314,7 +386,7 @@ impl Tile {
             Tile::ProjectTree => {
                 project_tree::paint(hdc, bounds, dpi, nav, sessions, focused);
             }
-            Tile::SessionGrid { scroll_y, cols, rows } => {
+            Tile::SessionGrid { scroll_y, grid } => {
                 grid_tile::paint(
                     hdc,
                     bounds,
@@ -323,8 +395,7 @@ impl Tile {
                     focused,
                     *scroll_y,
                     nav,
-                    *cols,
-                    *rows,
+                    *grid,
                     hovered_control,
                 );
             }
@@ -369,8 +440,8 @@ impl Tile {
             Tile::ProjectTree => {
                 project_tree::handle_lbutton_down(x, y, bounds, dpi, nav, sessions)
             }
-            Tile::SessionGrid { scroll_y, cols, rows } => grid_tile::handle_lbutton_down(
-                x, y, bounds, dpi, sessions, *scroll_y, nav, *cols, *rows,
+            Tile::SessionGrid { scroll_y, grid } => grid_tile::handle_lbutton_down(
+                x, y, bounds, dpi, sessions, *scroll_y, nav, *grid,
             ),
             _ => None,
         }
@@ -389,8 +460,8 @@ impl Tile {
     ) -> Option<SessionId> {
         match self {
             Tile::MainTerminal { session_id, .. } => *session_id,
-            Tile::SessionGrid { scroll_y, cols, rows } => {
-                grid_tile::session_at(x, y, bounds, dpi, sessions, *scroll_y, *cols, *rows)
+            Tile::SessionGrid { scroll_y, grid } => {
+                grid_tile::session_at(x, y, bounds, dpi, sessions, *scroll_y, *grid)
             }
             Tile::ProjectTree => None,
         }
@@ -437,11 +508,105 @@ impl Tile {
                 })
                 .unwrap_or(CursorHint::Arrow),
             Tile::ProjectTree => project_tree::cursor_at(x, y, bounds, dpi, nav, sessions),
-            Tile::SessionGrid { scroll_y, cols, rows } => {
-                grid_tile::cursor_at(x, y, bounds, dpi, sessions, *scroll_y, nav, *cols, *rows)
+            Tile::SessionGrid { scroll_y, grid } => {
+                grid_tile::cursor_at(x, y, bounds, dpi, sessions, *scroll_y, nav, *grid)
             }
             _ => CursorHint::Default,
         }
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel() -> RECT {
+        RECT {
+            left: 0,
+            top: 0,
+            right: 1200,
+            bottom: 800,
+        }
+    }
+
+    fn tiles(view: PanelView, nav_layout: NavLayout) -> Vec<(Tile, RECT)> {
+        let mut sessions = Sessions::new();
+        layout(
+            &view,
+            panel(),
+            96,
+            &mut sessions,
+            &VecDeque::new(),
+            None,
+            0,
+            3,
+            2,
+            nav_layout,
+            crate::terminal_view::FONT_POINT_SIZE,
+        )
+    }
+
+    fn sidebar(tiles: &[(Tile, RECT)]) -> Option<RECT> {
+        tiles.iter().find_map(|(tile, rect)| match tile {
+            Tile::ProjectTree => Some(*rect),
+            _ => None,
+        })
+    }
+
+    fn grid(tiles: &[(Tile, RECT)]) -> Option<(GridShape, RECT)> {
+        tiles.iter().find_map(|(tile, rect)| match tile {
+            Tile::SessionGrid { grid, .. } => Some((*grid, *rect)),
+            _ => None,
+        })
+    }
+
+    /// Out of the box the grid keeps the list in its first cell.
+    #[test]
+    fn the_grid_keeps_the_list_in_its_first_cell_by_default() {
+        let t = tiles(PanelView::Grid, NavLayout::default());
+        assert!(sidebar(&t).is_none());
+        let (shape, rect) = grid(&t).unwrap();
+        assert!(shape.nav_cell);
+        assert_eq!(rect, panel());
+    }
+
+    /// Docked as a sidebar, the list sits where the focus view puts it and
+    /// the grid takes the rest, every cell of it a session's.
+    #[test]
+    fn a_docked_list_is_a_sidebar_beside_the_grid() {
+        let docked = NavLayout {
+            grid_sidebar: true,
+            ..NavLayout::default()
+        };
+        let t = tiles(PanelView::Grid, docked);
+        let side = sidebar(&t).expect("a sidebar");
+        let (shape, rect) = grid(&t).unwrap();
+        assert!(!shape.nav_cell);
+        assert_eq!(rect.left, side.right);
+        assert_eq!(rect.right, panel().right);
+
+        let focus = tiles(PanelView::Dashboard { queue_mode: false }, docked);
+        assert_eq!(sidebar(&focus), Some(side));
+    }
+
+    /// Collapsed, the list is gone from every view, wherever it was docked.
+    #[test]
+    fn a_collapsed_list_leaves_the_whole_panel_to_the_sessions() {
+        for grid_sidebar in [false, true] {
+            let collapsed = NavLayout {
+                collapsed: true,
+                grid_sidebar,
+            };
+            let t = tiles(PanelView::Grid, collapsed);
+            assert!(sidebar(&t).is_none());
+            let (shape, rect) = grid(&t).unwrap();
+            assert!(!shape.nav_cell);
+            assert_eq!(rect, panel());
+
+            let focus = tiles(PanelView::Dashboard { queue_mode: false }, collapsed);
+            assert!(sidebar(&focus).is_none());
+            assert_eq!(focus[0].1, panel());
+        }
+    }
+}

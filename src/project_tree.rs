@@ -26,7 +26,8 @@
 //!
 //! The header band is pinned above the rows and never scrolls: `New` picks
 //! a directory the scanner hasn't seen, and the magnifier slides a filter
-//! box open leftwards. Everything below it walks the [`rows`] list, so
+//! box open leftwards. In the grid view a dock glyph sits in the corner
+//! after them, moving the tree between the grid's first cell and a sidebar. Everything below it walks the [`rows`] list, so
 //! hit-testing can't drift from what's drawn.
 
 use std::collections::HashSet;
@@ -36,7 +37,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 
-use crate::dashboard::{CursorHint, NavSearch, NavState, TileAction};
+use crate::dashboard::{CursorHint, GridDock, NavSearch, NavState, TileAction};
 use crate::native_interop::{self, Color, UiFace};
 use crate::projects::{AttentionRow, ProjectNode};
 use crate::sessions::{SessionId, SessionStatus, Sessions};
@@ -79,6 +80,10 @@ const CONFIRM_LABEL: &str = "Remove?";
 /// Icon-font glyphs drawn in the nav, and their em height.
 const GLYPH_DELETE: char = '\u{E74D}';
 const GLYPH_MACHINE: char = '\u{E7F4}';
+/// The header's dock control: a sidebar to dock into, or the grid to go
+/// back into — whichever the tree isn't in.
+const GLYPH_DOCK_SIDEBAR: char = '\u{E90C}';
+const GLYPH_DOCK_GRID: char = '\u{E8A9}';
 const GLYPH_PX: i32 = 12;
 
 /// "New" badge: an outlined pill, no fill — the panel's controls are
@@ -149,6 +154,9 @@ pub enum NavTarget {
     /// The filter box itself. Clickable so a click inside it doesn't fall
     /// through to the row underneath and dismiss what you're typing in.
     SearchField,
+    /// The header's dock glyph — move the grid view's tree between its
+    /// first cell and a sidebar.
+    GridDock,
 }
 
 enum RowKind<'a> {
@@ -313,12 +321,32 @@ fn body_rect(bounds: &RECT, dpi: u32) -> RECT {
     }
 }
 
-/// The "New" badge, pinned to the header's right edge.
-fn badge_rect(bounds: &RECT, dpi: u32) -> RECT {
+/// The dock glyph, pinned to the header's right edge. Only drawn in the grid
+/// view.
+fn dock_rect(bounds: &RECT, dpi: u32) -> RECT {
+    let header = header_rect(bounds, dpi);
+    let size = scaled(GLYPH_SIZE, dpi);
+    let right = header.right - scaled(PAD_X, dpi);
+    let top = (header.top + header.bottom) / 2 - size / 2;
+    RECT {
+        left: right - size,
+        top,
+        right,
+        bottom: top + size,
+    }
+}
+
+/// The "New" badge: pinned to the header's right edge, or just left of the
+/// dock glyph when `dock` puts one there.
+fn badge_rect(bounds: &RECT, dpi: u32, dock: bool) -> RECT {
     let header = header_rect(bounds, dpi);
     let w = scaled(BADGE_W, dpi);
     let h = scaled(BADGE_H, dpi);
-    let right = header.right - scaled(PAD_X, dpi);
+    let right = if dock {
+        dock_rect(bounds, dpi).left - scaled(GLYPH_GAP, dpi)
+    } else {
+        header.right - scaled(PAD_X, dpi)
+    };
     let top = (header.top + header.bottom) / 2 - h / 2;
     RECT {
         left: right - w,
@@ -329,8 +357,8 @@ fn badge_rect(bounds: &RECT, dpi: u32) -> RECT {
 }
 
 /// The magnifier, left of the badge.
-fn search_icon_rect(bounds: &RECT, dpi: u32) -> RECT {
-    let badge = badge_rect(bounds, dpi);
+fn search_icon_rect(bounds: &RECT, dpi: u32, dock: bool) -> RECT {
+    let badge = badge_rect(bounds, dpi, dock);
     let size = scaled(GLYPH_SIZE, dpi);
     let right = badge.left - scaled(GLYPH_GAP, dpi);
     let top = (badge.top + badge.bottom) / 2 - size / 2;
@@ -345,12 +373,12 @@ fn search_icon_rect(bounds: &RECT, dpi: u32) -> RECT {
 /// The filter box, extending leftwards from the magnifier by `anim` of its
 /// full width. `None` while it is closed, or when the tile is too narrow to
 /// give it any room at all.
-fn search_field_rect(bounds: &RECT, dpi: u32, anim: f64) -> Option<RECT> {
+fn search_field_rect(bounds: &RECT, dpi: u32, anim: f64, dock: bool) -> Option<RECT> {
     let anim = anim.clamp(0.0, 1.0);
     if anim <= 0.0 {
         return None;
     }
-    let icon = search_icon_rect(bounds, dpi);
+    let icon = search_icon_rect(bounds, dpi, dock);
     let right = icon.left - scaled(GLYPH_GAP, dpi);
     let full = scaled(SEARCH_FIELD_W, dpi).min(right - (bounds.left + scaled(PAD_X, dpi)));
     if full <= 0 {
@@ -535,13 +563,17 @@ pub fn target_at(
     }
     let inflate_by = scaled(HEADER_HIT_INFLATE, dpi);
     if contains(&header_rect(&bounds, dpi), x, y) {
-        if contains(&inflate(badge_rect(&bounds, dpi), inflate_by), x, y) {
+        let dock = nav.grid_dock.is_some();
+        if dock && contains(&inflate(dock_rect(&bounds, dpi), inflate_by), x, y) {
+            return Some(NavTarget::GridDock);
+        }
+        if contains(&inflate(badge_rect(&bounds, dpi, dock), inflate_by), x, y) {
             return Some(NavTarget::NewProject);
         }
-        if contains(&inflate(search_icon_rect(&bounds, dpi), inflate_by), x, y) {
+        if contains(&inflate(search_icon_rect(&bounds, dpi, dock), inflate_by), x, y) {
             return Some(NavTarget::SearchToggle);
         }
-        return match search_field_rect(&bounds, dpi, nav.search.anim) {
+        return match search_field_rect(&bounds, dpi, nav.search.anim, dock) {
             Some(field) if contains(&field, x, y) => Some(NavTarget::SearchField),
             _ => None,
         };
@@ -646,6 +678,7 @@ pub fn action_for(target: NavTarget, tree: &[ProjectNode]) -> Option<TileAction>
         NavTarget::ShowMore(i) => Some(TileAction::ToggleHistory(tree.get(i)?.path.clone())),
         NavTarget::NewProject => Some(TileAction::PickNewProject),
         NavTarget::SearchToggle => Some(TileAction::ToggleSearch),
+        NavTarget::GridDock => Some(TileAction::ToggleGridDock),
         // Clicking inside the open box is just "keep typing".
         NavTarget::SearchField => None,
     }
@@ -1125,7 +1158,8 @@ pub fn paint(
 }
 
 /// The pinned header: title on the left, then the filter box, the
-/// magnifier and the "New" badge running to the right edge. The title is
+/// magnifier, the "New" badge and — in the grid view — the dock glyph
+/// running to the right edge. The title is
 /// given whatever the controls leave it, so the box sliding open simply
 /// pushes it out of the way.
 fn paint_header(
@@ -1138,9 +1172,23 @@ fn paint_header(
     badge_font: HFONT,
 ) {
     let header = header_rect(bounds, dpi);
-    let badge = badge_rect(bounds, dpi);
-    let icon = search_icon_rect(bounds, dpi);
-    let field = search_field_rect(bounds, dpi, nav.search.anim);
+    let dock = nav.grid_dock.is_some();
+    let badge = badge_rect(bounds, dpi, dock);
+    let icon = search_icon_rect(bounds, dpi, dock);
+    let field = search_field_rect(bounds, dpi, nav.search.anim, dock);
+
+    if let Some(state) = nav.grid_dock {
+        let glyph = match state {
+            GridDock::Cell => GLYPH_DOCK_SIDEBAR,
+            GridDock::Sidebar => GLYPH_DOCK_GRID,
+        };
+        let color = if nav.hovered == Some(NavTarget::GridDock) {
+            Color::from_hex(ORANGE_HEX)
+        } else {
+            Color::from_hex(META_FG_HEX)
+        };
+        native_interop::draw_glyph(hdc, glyph, dock_rect(bounds, dpi), scaled(GLYPH_PX, dpi), color);
+    }
 
     paint_badge(
         hdc,
@@ -1548,6 +1596,7 @@ mod tests {
             hovered: None,
             armed_remove: None,
             search: NavSearch::default(),
+            grid_dock: None,
         }
     }
 
@@ -1871,8 +1920,8 @@ mod tests {
         let mut nav = nav_state(&tree, &[], &expanded, 0);
         let sessions = Sessions::new();
 
-        let badge = badge_rect(&bounds, 96);
-        let icon = search_icon_rect(&bounds, 96);
+        let badge = badge_rect(&bounds, 96, false);
+        let icon = search_icon_rect(&bounds, 96, false);
         let mid = |r: &RECT| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
 
         let (bx, by) = mid(&badge);
@@ -1895,7 +1944,7 @@ mod tests {
             query: "",
             anim: 1.0,
         };
-        let field = search_field_rect(&bounds, 96, 1.0).expect("field at full width");
+        let field = search_field_rect(&bounds, 96, 1.0, false).expect("field at full width");
         let (fx, fy) = mid(&field);
         assert_eq!(
             target_at(fx, fy, bounds, 96, &nav, &sessions),
@@ -1904,16 +1953,51 @@ mod tests {
         assert!(action_for(NavTarget::SearchField, &tree).is_none());
     }
 
+    /// In the grid view the dock glyph takes the corner and the other
+    /// controls step left to make room for it; elsewhere there is none.
+    #[test]
+    fn the_grid_views_header_has_a_dock_control() {
+        let bounds = tile();
+        let tree = vec![node("a", 0, 0)];
+        let expanded = HashSet::new();
+        let mut nav = nav_state(&tree, &[], &expanded, 0);
+        let sessions = Sessions::new();
+        let dock = dock_rect(&bounds, 96);
+        let (dx, dy) = ((dock.left + dock.right) / 2, (dock.top + dock.bottom) / 2);
+
+        assert_ne!(
+            target_at(dx, dy, bounds, 96, &nav, &sessions),
+            Some(NavTarget::GridDock)
+        );
+
+        nav.grid_dock = Some(GridDock::Cell);
+        assert_eq!(
+            target_at(dx, dy, bounds, 96, &nav, &sessions),
+            Some(NavTarget::GridDock)
+        );
+        assert!(matches!(
+            action_for(NavTarget::GridDock, &tree),
+            Some(TileAction::ToggleGridDock)
+        ));
+        let badge = badge_rect(&bounds, 96, true);
+        assert!(badge.right <= dock.left);
+        let (bx, by) = ((badge.left + badge.right) / 2, (badge.top + badge.bottom) / 2);
+        assert_eq!(
+            target_at(bx, by, bounds, 96, &nav, &sessions),
+            Some(NavTarget::NewProject)
+        );
+    }
+
     /// Half-open, the box is narrower and gives the space back as it goes.
     #[test]
     fn the_filter_box_slides_from_the_magnifier() {
         let bounds = tile();
-        let open = search_field_rect(&bounds, 96, 1.0).expect("open");
-        let half = search_field_rect(&bounds, 96, 0.5).expect("half");
+        let open = search_field_rect(&bounds, 96, 1.0, false).expect("open");
+        let half = search_field_rect(&bounds, 96, 0.5, false).expect("half");
         assert_eq!(open.right, half.right);
         assert!(half.left > open.left);
-        assert!(open.right <= search_icon_rect(&bounds, 96).left);
-        assert!(search_field_rect(&bounds, 96, 0.0).is_none());
+        assert!(open.right <= search_icon_rect(&bounds, 96, false).left);
+        assert!(search_field_rect(&bounds, 96, 0.0, false).is_none());
     }
 
     #[test]
