@@ -10,7 +10,7 @@
 //! creating a new session.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::HDC;
@@ -38,6 +38,9 @@ pub struct NavState<'a> {
     pub history_expanded: &'a HashSet<PathBuf>,
     pub scroll_y: i32,
     pub hovered: Option<NavTarget>,
+    /// The project whose remove control has been clicked once and is
+    /// showing its "Remove?" confirmation.
+    pub armed_remove: Option<&'a Path>,
     pub search: NavSearch<'a>,
 }
 
@@ -92,6 +95,9 @@ pub enum TileAction {
     /// Take a project out of the nav. Its transcripts stay on disk; starting
     /// a session in the directory again brings it back.
     HideProject(PathBuf),
+    /// Show or dismiss the "Remove?" confirmation on a project row — the
+    /// first click on its trash can, which removes nothing by itself.
+    ToggleRemoveConfirm(PathBuf),
     /// Collapse / expand a project in the nav tree, keyed by path so the
     /// state survives the scanner reordering the tree.
     ToggleProject(PathBuf),

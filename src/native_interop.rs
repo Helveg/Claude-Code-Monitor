@@ -295,6 +295,34 @@ pub fn icon_font(px: i32) -> windows::Win32::Graphics::Gdi::HFONT {
     create_font(-px, 400, name)
 }
 
+/// Draw one icon-font glyph centred on `rect`, `px` device pixels tall.
+pub fn draw_glyph(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    glyph: char,
+    rect: RECT,
+    px: i32,
+    color: Color,
+) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::*;
+    let font = icon_font(px);
+    let mut wide: Vec<u16> = glyph.to_string().encode_utf16().collect();
+    let mut rect = rect;
+    unsafe {
+        let old = SelectObject(hdc, font);
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old);
+        let _ = DeleteObject(font);
+    }
+}
+
 /// The system I-beam, made solid white instead of screen-inverting.
 ///
 /// `IDC_IBEAM` is drawn entirely out of invert-the-screen pixels, which is why
