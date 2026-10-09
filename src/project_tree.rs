@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! Projects                          ⌕  New
+//! ▸ This machine                        3  +
 //! ▾ Claude-Code-Monitor                    +
 //!   ● turn the nav into a project tree
 //!   ○ cleaned up terminal code
@@ -16,7 +17,9 @@
 //! resumes it into a new terminal. The `+` on a project row starts a fresh
 //! session in that directory; hovering the row also shows a trash can
 //! further left. Clicking it asks "Remove?" beside it, and only clicking
-//! that takes the project out of the nav. Every live session is listed, but only the
+//! that takes the project out of the nav. The home directory is pinned
+//! first as "This machine" — a `+` for one-off sessions that belong to no
+//! project — and has no trash can. Every live session is listed, but only the
 //! [`HISTORY_PREVIEW`] most recent conversations — the rest wait behind the
 //! "show more" row, so a directory with hundreds of transcripts still opens
 //! to something readable.
@@ -75,6 +78,7 @@ const CONFIRM_GAP: i32 = 6;
 const CONFIRM_LABEL: &str = "Remove?";
 /// Icon-font glyphs drawn in the nav, and their em height.
 const GLYPH_DELETE: char = '\u{E74D}';
+const GLYPH_MACHINE: char = '\u{E7F4}';
 const GLYPH_PX: i32 = 12;
 
 /// "New" badge: an outlined pill, no fill — the panel's controls are
@@ -165,7 +169,11 @@ enum RowKind<'a> {
         children: usize,
         /// Whether the row offers its trash can. A project with sessions in
         /// the workspace can't be removed: they would only bring it back.
+        /// Nor can the pinned home row.
         removable: bool,
+        /// The pinned home row — drawn with the machine glyph, and set off
+        /// from the projects below it by a hairline.
+        pinned: bool,
     },
     Live {
         id: SessionId,
@@ -236,7 +244,8 @@ fn rows<'a>(nav: &NavState<'a>, sessions: &Sessions) -> Vec<Row<'a>> {
                 name: node.name.as_str(),
                 expanded: is_expanded,
                 children: node.child_count(),
-                removable: node.live.is_empty(),
+                removable: !node.pinned && node.live.is_empty(),
+                pinned: node.pinned,
             },
             height: PROJECT_ROW_H,
         });
@@ -770,6 +779,10 @@ pub fn paint(
 
     let pinned = pinned_run(&rows, &body, dpi);
     let band_bottom = pinned_bottom(&body, dpi, &rows, pinned);
+    // Whether a pinned project row has been drawn yet, and whether the
+    // hairline under the pinned block has.
+    let mut seen_pinned = false;
+    let mut divided = false;
 
     for i in 0..rows.len() {
         let rect = row_rect(&body, dpi, &rows, nav.scroll_y, i, pinned);
@@ -856,6 +869,7 @@ pub fn paint(
                 expanded,
                 children,
                 removable,
+                pinned,
             } => {
                 let row_hovered = nav.hovered == Some(NavTarget::Project(index));
                 if row_hovered {
@@ -943,8 +957,40 @@ pub fn paint(
                     label_right = count_rect.left - scaled(COUNT_GAP, dpi);
                 }
 
+                let mut label_left = chevron_x + chevron_size + scaled(CHEVRON_GAP, dpi);
+                // The pinned home row is the machine, not a project: a
+                // monitor glyph says so ahead of its name.
+                if pinned {
+                    let size = scaled(GLYPH_PX, dpi);
+                    let glyph = RECT {
+                        left: label_left,
+                        top: rect.top,
+                        right: label_left + size,
+                        bottom: rect.bottom,
+                    };
+                    native_interop::draw_glyph(
+                        hdc,
+                        GLYPH_MACHINE,
+                        glyph,
+                        size,
+                        Color::from_hex(SESSION_FG_HEX),
+                    );
+                    label_left = glyph.right + scaled(GLYPH_GAP, dpi);
+                    seen_pinned = true;
+                } else if seen_pinned && !divided {
+                    // A hairline closes the pinned block off from the
+                    // projects listed under it.
+                    let divider = RECT {
+                        left: rect.left + pad_x,
+                        top: rect.top,
+                        right: rect.right - pad_x,
+                        bottom: rect.top + scaled(1, dpi).max(1),
+                    };
+                    fill(hdc, &divider, Color::from_hex(DIVIDER_HEX));
+                    divided = true;
+                }
                 let label_rect = RECT {
-                    left: chevron_x + chevron_size + scaled(CHEVRON_GAP, dpi),
+                    left: label_left,
                     top: rect.top,
                     right: label_right,
                     bottom: rect.bottom,
@@ -1446,6 +1492,7 @@ mod tests {
                     last_modified: SystemTime::UNIX_EPOCH,
                 })
                 .collect(),
+            pinned: false,
         }
     }
 
