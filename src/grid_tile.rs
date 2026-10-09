@@ -975,7 +975,7 @@ pub fn cursor_at(
                 let term = s.session_view.terminal();
                 if s.is_dormant() {
                     CursorHint::Arrow
-                } else if term.over_scrollbar(x, y, dpi) {
+                } else if term.over_scrollbar(x, y, dpi) || term.over_clickable_link(x, y) {
                     CursorHint::Hand
                 } else if point_in(&term.bounds(), x, y) {
                     CursorHint::IBeam

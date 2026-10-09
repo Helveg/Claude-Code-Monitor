@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::DataExchange::{
@@ -26,10 +26,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_HOME, VK_INSERT,
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SW_SHOWNORMAL};
 
 use crate::native_interop::{self, Color};
-use crate::terminal::{Cell, Terminal};
+use crate::terminal::{AnsiColor, Cell, Terminal};
 
 pub const FONT_POINT_SIZE: i32 = 11;
 /// Range the user can zoom the terminals through. The floor is where the
@@ -60,6 +61,9 @@ const SCROLLBAR_THUMB_ACTIVE_HEX: &str = "#6C6C64";
 
 const CLAUDE_GREY_HEX: &str = "#262624";
 const DEFAULT_FG_HEX: &str = "#E8E8E8";
+/// Lilac: reads as a link on Claude grey without competing with claude's
+/// own orange accents.
+const LINK_FG_HEX: &str = "#C8A2F0";
 
 /// A range of text the user has selected. Rows are absolute line indices in
 /// the grid's [`viewport_origin`](crate::terminal::Grid::viewport_origin)
@@ -130,6 +134,9 @@ pub struct TerminalView {
     /// rather than on the panel so the existing press → move → release
     /// routing carries it without a second drag protocol.
     scroll_drag: Mutex<Option<i32>>,
+    /// Link under the last press. A release without a drag opens it; a drag
+    /// makes the press a selection instead.
+    pressed_link: Mutex<Option<String>>,
     host_hwnd: HWND,
     notify_msg: u32,
     cmd: String,
@@ -163,6 +170,7 @@ impl TerminalView {
             selection: Mutex::new(None),
             mouse_dragging: AtomicBool::new(false),
             scroll_drag: Mutex::new(None),
+            pressed_link: Mutex::new(None),
             host_hwnd,
             notify_msg,
             cmd: cmd.into(),
@@ -352,6 +360,8 @@ impl TerminalView {
         if self.press_scrollbar(x, y) {
             return;
         }
+        *self.pressed_link.lock().unwrap_or_else(|e| e.into_inner()) =
+            ctrl_held().then(|| self.link_at(x, y)).flatten();
         if let Some((row, col)) = self.cell_at(x, y) {
             {
                 let line = self.viewport_origin() + row as u64;
@@ -467,6 +477,7 @@ impl TerminalView {
             unsafe {
                 let _ = ReleaseCapture();
             }
+            let link = self.pressed_link.lock().unwrap_or_else(|e| e.into_inner()).take();
             // Collapse zero-area selections so they don't render.
             let mut sel = self.selection.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(s) = sel.as_ref() {
@@ -476,9 +487,33 @@ impl TerminalView {
                     unsafe {
                         let _ = InvalidateRect(self.host_hwnd, None, false);
                     }
+                    // A click that never became a selection, on a link.
+                    if let Some(url) = link {
+                        open_url(&url);
+                    }
                 }
             }
         }
+    }
+
+    /// True when a click at `(x, y)` would open a link: Ctrl is held over
+    /// one. Drives the hand cursor.
+    pub fn over_clickable_link(&self, x: i32, y: i32) -> bool {
+        ctrl_held() && self.link_at(x, y).is_some()
+    }
+
+    /// The URL under `(x, y)`: an OSC 8 hyperlink's target, or a bare
+    /// `http(s)://` URL in the text. Ctrl+click opens it; a plain click
+    /// selects text, as on the rest of the terminal.
+    pub fn link_at(&self, x: i32, y: i32) -> Option<String> {
+        let (row, col) = self.cell_at(x, y)?;
+        let terminal = self.terminal.as_ref()?;
+        let g = terminal.grid.lock().unwrap_or_else(|e| e.into_inner());
+        let id = g.display_cell(row, col).attrs.link;
+        if let Some(target) = g.link(id) {
+            return is_openable(target).then(|| target.to_string());
+        }
+        plain_url_at(&g, row, col)
     }
 
     /// Forward a WM_CHAR code to the PTY, with platform-specific remappings.
@@ -893,6 +928,178 @@ impl TerminalView {
     }
 }
 
+/// Longest run of soft-wrapped rows a bare URL is followed across.
+const URL_MAX_ROWS: u16 = 8;
+
+/// A bare URL in the text covering viewport cell `(row, col)`. The grid
+/// doesn't record soft wraps, so a row whose last column is filled is taken
+/// to continue on the next one — that is how a long URL printed by a CLI
+/// lands on screen.
+fn plain_url_at(grid: &crate::terminal::Grid, row: u16, col: u16) -> Option<String> {
+    let cols = grid.cols;
+    let full = |r: u16| grid.display_cell(r, cols - 1).ch != ' ';
+    let mut first = row;
+    while first > 0 && row - first < URL_MAX_ROWS && full(first - 1) {
+        first -= 1;
+    }
+    let mut last = row;
+    while last + 1 < grid.rows && last - first < URL_MAX_ROWS && full(last) {
+        last += 1;
+    }
+    let text: Vec<char> = (first..=last)
+        .flat_map(|r| (0..cols).map(move |c| (r, c)))
+        .map(|(r, c)| grid.display_cell(r, c).ch)
+        .collect();
+    let at = (row - first) as usize * cols as usize + col as usize;
+    url_in_text(&text, at)
+}
+
+/// Which cells of viewport rows `rows` belong to an openable link — an OSC 8
+/// hyperlink or a bare URL, the same two [`TerminalView::link_at`] answers
+/// for. Indexed `(row - rows.start) * grid.cols + col`.
+fn link_mask(grid: &crate::terminal::Grid, rows: std::ops::Range<u16>) -> Vec<bool> {
+    let cols = grid.cols;
+    let mut mask = vec![false; rows.len() * cols as usize];
+    let mut mark = |row: u16, col: u16| {
+        if rows.contains(&row) {
+            mask[(row - rows.start) as usize * cols as usize + col as usize] = true;
+        }
+    };
+    for row in rows.clone() {
+        for col in 0..cols {
+            let id = grid.display_cell(row, col).attrs.link;
+            if grid.link(id).is_some_and(is_openable) {
+                mark(row, col);
+            }
+        }
+    }
+    // Bare URLs, read across the same soft-wrap chains `plain_url_at` follows,
+    // starting far enough up to catch a URL that began above the first row.
+    let full = |r: u16| grid.display_cell(r, cols - 1).ch != ' ';
+    let mut first = rows.start;
+    while first > 0 && rows.start - first < URL_MAX_ROWS && full(first - 1) {
+        first -= 1;
+    }
+    while first < rows.end {
+        let mut last = first;
+        while last + 1 < grid.rows && last - first < URL_MAX_ROWS && full(last) {
+            last += 1;
+        }
+        let text: Vec<char> = (first..=last)
+            .flat_map(|r| (0..cols).map(move |c| (r, c)))
+            .map(|(r, c)| grid.display_cell(r, c).ch)
+            .collect();
+        for span in url_spans(&text) {
+            for i in span {
+                mark(first + (i / cols as usize) as u16, (i % cols as usize) as u16);
+            }
+        }
+        first = last + 1;
+    }
+    mask
+}
+
+/// Index ranges of every bare URL in `text`, as [`url_in_text`] delimits them.
+fn url_spans(text: &[char]) -> Vec<std::ops::Range<usize>> {
+    let starts_with = |i: usize, prefix: &str| {
+        prefix.chars().enumerate().all(|(k, p)| text.get(i + k) == Some(&p))
+    };
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if starts_with(i, "http://") || starts_with(i, "https://") {
+            if let Some(url) = url_in_text(text, i) {
+                let end = i + url.chars().count();
+                spans.push(i..end);
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// The `http://` / `https://` URL in `text` that spans index `at`.
+fn url_in_text(text: &[char], at: usize) -> Option<String> {
+    if !text.get(at).copied().is_some_and(is_url_char) {
+        return None;
+    }
+    let mut start = at;
+    while start > 0 && is_url_char(text[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at + 1;
+    while end < text.len() && is_url_char(text[end]) {
+        end += 1;
+    }
+    let word: String = text[start..end].iter().collect();
+    // A URL glued to the text before it (`(https://…`, `url:https://…`).
+    let scheme = word.find("https://").or_else(|| word.find("http://"))?;
+    if start + word[..scheme].chars().count() > at {
+        return None;
+    }
+    let mut url = &word[scheme..];
+    // Sentence punctuation and a closing bracket that has no opener inside
+    // the URL belong to the surrounding prose.
+    loop {
+        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '"']);
+        let trimmed = match trimmed.chars().last() {
+            Some(close @ (')' | ']')) => {
+                let open = if close == ')' { '(' } else { '[' };
+                if trimmed.matches(open).count() < trimmed.matches(close).count() {
+                    &trimmed[..trimmed.len() - 1]
+                } else {
+                    trimmed
+                }
+            }
+            _ => trimmed,
+        };
+        if trimmed.len() == url.len() {
+            break;
+        }
+        url = trimmed;
+    }
+    let end_char = start + word[..scheme].chars().count() + url.chars().count();
+    if at >= end_char || url.ends_with("//") {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+fn ctrl_held() -> bool {
+    unsafe { (GetKeyState(VK_CONTROL.0 as i32) as i16) < 0 }
+}
+
+fn is_url_char(c: char) -> bool {
+    c.is_ascii_graphic() && !matches!(c, '<' | '>' | '"' | '`' | '{' | '}' | '|' | '\\' | '^')
+}
+
+/// Only web links are handed to the shell: an OSC 8 target is whatever the
+/// program in the terminal printed, and `ShellExecute` would run a
+/// `file://` path or an executable just as readily.
+fn is_openable(url: &str) -> bool {
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+fn open_url(url: &str) {
+    if !is_openable(url) {
+        return;
+    }
+    let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 fn point_in(rect: &RECT, x: i32, y: i32) -> bool {
     x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
 }
@@ -1034,6 +1241,20 @@ pub fn render_grid_region(
         glyph_indices.get(i).copied().unwrap_or(0) == 0xFFFF
     };
 
+    // Links draw lilac and underlined, over whatever style the program gave
+    // their text.
+    let links = link_mask(grid, row_start..row_end);
+    let link_cell = |row: u16, col: u16| -> Cell {
+        let mut cell = grid.display_cell(row, col);
+        if links[(row - row_start) as usize * grid.cols as usize + col as usize] {
+            let lilac = Color::from_hex(LINK_FG_HEX);
+            cell.attrs.fg = Some(AnsiColor::Rgb(lilac.r, lilac.g, lilac.b));
+            cell.attrs.dim = false;
+            cell.attrs.underline = true;
+        }
+        cell
+    };
+
     let pixel_y = |row: u16| -> i32 { bounds.top + (row - row_start) as i32 * cell_h };
 
     // Pass 1: backgrounds — coalesce horizontal runs.
@@ -1041,11 +1262,11 @@ pub fn render_grid_region(
         let y = pixel_y(row);
         let mut col = 0u16;
         while col < visible_cols {
-            let cell = grid.display_cell(row, col);
+            let cell = link_cell(row, col);
             let (_, bg) = cell_render_colors(&cell, row, col);
             let mut run_end = col + 1;
             while run_end < visible_cols {
-                let next = grid.display_cell(row, run_end);
+                let next = link_cell(row, run_end);
                 let (_, next_bg) = cell_render_colors(&next, row, run_end);
                 if next_bg.r != bg.r || next_bg.g != bg.g || next_bg.b != bg.b {
                     break;
@@ -1074,14 +1295,14 @@ pub fn render_grid_region(
         let y = pixel_y(row);
         let mut col = 0u16;
         while col < visible_cols {
-            let cell = grid.display_cell(row, col);
+            let cell = link_cell(row, col);
             let (fg, _) = cell_render_colors(&cell, row, col);
             let style = GlyphStyle::of(&cell, needs_symbol(row, col));
             let mut text_buf: Vec<u16> = Vec::new();
             let mut dx_buf: Vec<i32> = Vec::new();
             let mut run_end = col;
             while run_end < visible_cols {
-                let c = grid.display_cell(row, run_end);
+                let c = link_cell(row, run_end);
                 let (next_fg, _) = cell_render_colors(&c, row, run_end);
                 if next_fg.r != fg.r || next_fg.g != fg.g || next_fg.b != fg.b {
                     break;
@@ -1614,6 +1835,52 @@ mod tests {
 
     /// Caught up puts the thumb at the bottom, the oldest line at the top,
     /// and the thumb is the screen's share of the whole conversation.
+    fn url_at(text: &str, at: usize) -> Option<String> {
+        url_in_text(&text.chars().collect::<Vec<_>>(), at)
+    }
+
+    #[test]
+    fn a_bare_url_is_found_from_any_of_its_cells() {
+        let text = "see https://example.com/a?b=1 now";
+        assert_eq!(url_at(text, 4).as_deref(), Some("https://example.com/a?b=1"));
+        assert_eq!(url_at(text, 28).as_deref(), Some("https://example.com/a?b=1"));
+        assert_eq!(url_at(text, 2), None);
+        assert_eq!(url_at(text, 30), None);
+    }
+
+    #[test]
+    fn surrounding_punctuation_stays_out_of_the_url() {
+        let text = "(see https://en.wikipedia.org/wiki/Rust_(language)).";
+        assert_eq!(
+            url_at(text, 10).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Rust_(language)")
+        );
+        // The trailing `).` is prose, not link.
+        assert_eq!(url_at(text, 51), None);
+        assert_eq!(url_at("(http://a.example)", 0), None);
+        assert_eq!(url_at("(http://a.example)", 3).as_deref(), Some("http://a.example"));
+    }
+
+    #[test]
+    fn every_url_on_a_line_gets_a_span() {
+        let text: Vec<char> = "a https://x.example, (http://y.example) b".chars().collect();
+        assert_eq!(url_spans(&text), vec![2..19, 22..38]);
+    }
+
+    #[test]
+    fn text_without_a_scheme_is_not_a_link() {
+        assert_eq!(url_at("example.com/path", 3), None);
+        assert_eq!(url_at("https://", 2), None);
+    }
+
+    #[test]
+    fn only_web_links_are_openable() {
+        assert!(is_openable("https://a.example"));
+        assert!(is_openable("HTTP://a.example"));
+        assert!(!is_openable("file:///C:/Windows/notepad.exe"));
+        assert!(!is_openable("C:\\Windows\\notepad.exe"));
+    }
+
     #[test]
     fn the_thumb_sits_where_the_viewport_is() {
         let (top, h) = thumb_geometry(TRACK_H, MIN_THUMB, 100, 20, 0);

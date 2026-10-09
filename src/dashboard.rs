@@ -495,7 +495,7 @@ impl Tile {
                         };
                     }
                     let term = s.session_view.terminal();
-                    if term.over_scrollbar(x, y, dpi) {
+                    if term.over_scrollbar(x, y, dpi) || term.over_clickable_link(x, y) {
                         return CursorHint::Hand;
                     }
                     let inner = term.bounds();

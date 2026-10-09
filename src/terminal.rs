@@ -127,11 +127,19 @@ pub struct CellAttrs {
     pub underline: bool,
     pub strikethrough: bool,
     pub reverse: bool,
+    /// OSC 8 hyperlink: 1-based index into the owning grid's link table
+    /// (see [`Grid::link`]), 0 for plain text.
+    pub link: u32,
 }
 
 impl CellAttrs {
+    /// SGR 0. The hyperlink is not a graphic rendition: it stays open until
+    /// the OSC 8 that closes it, however the label is styled in between.
     fn reset(&mut self) {
-        *self = CellAttrs::default();
+        *self = CellAttrs {
+            link: self.link,
+            ..CellAttrs::default()
+        };
     }
 
     /// True when any glyph-shaping / intensity attribute is set. Colors and
@@ -218,6 +226,10 @@ pub struct Grid {
     /// True for the grid that backs the alt screen (?1049h). Alt-screen
     /// content is transient, so it never feeds scrollback.
     is_alt: bool,
+    /// OSC 8 targets referenced by `CellAttrs::link`, deduplicated. Never
+    /// trimmed, so ids held by scrollback lines stay valid; a TUI repainting
+    /// the same links re-uses their entries.
+    links: Vec<String>,
 }
 
 /// Scrollback line cap. ~5k lines of an 80-wide grid is a few MB per
@@ -266,6 +278,7 @@ impl Grid {
             view_offset: 0,
             trimmed_lines: 0,
             is_alt: false,
+            links: Vec::new(),
         }
     }
 
@@ -378,6 +391,24 @@ impl Grid {
         if self.view_offset > 0 {
             self.view_offset = (self.view_offset + n).min(self.scrollback.len());
         }
+    }
+
+    /// Target of the OSC 8 hyperlink with this id, as stored in
+    /// `CellAttrs::link`. `None` for 0 (no link).
+    pub fn link(&self, id: u32) -> Option<&str> {
+        let idx = (id as usize).checked_sub(1)?;
+        self.links.get(idx).map(String::as_str)
+    }
+
+    fn intern_link(&mut self, uri: &str) -> u32 {
+        let idx = match self.links.iter().rposition(|l| l == uri) {
+            Some(i) => i,
+            None => {
+                self.links.push(uri.to_string());
+                self.links.len() - 1
+            }
+        };
+        idx as u32 + 1
     }
 
     /// Read and clear the dirty flag. Called by the worker after each parse
@@ -759,9 +790,16 @@ pub struct Parser {
     /// (BEL or `ESC \`). Capped to keep a malformed/huge OSC from
     /// growing unboundedly.
     osc_buf: Vec<u8>,
+    /// The body was cut off at `OSC_BUF_LIMIT`; it is dropped rather than
+    /// acted on, so a long link is never stored truncated.
+    osc_overflow: bool,
+    /// The string being collected is an OSC proper, not a DCS / SOS / PM /
+    /// APC body sharing the collector.
+    osc_is_command: bool,
 }
 
-const OSC_BUF_LIMIT: usize = 1024;
+/// Room for a long sign-in URL with its query string.
+const OSC_BUF_LIMIT: usize = 8192;
 
 impl Parser {
     pub fn new() -> Self {
@@ -776,6 +814,8 @@ impl Parser {
             using_alt: false,
             alt_grid: None,
             osc_buf: Vec::new(),
+            osc_overflow: false,
+            osc_is_command: false,
         }
     }
 
@@ -806,7 +846,7 @@ impl Parser {
             }
             ParseState::Esc => self.esc_byte(grid, b),
             ParseState::Csi | ParseState::CsiPrivate => self.csi_byte(grid, b),
-            ParseState::Osc => self.osc_byte(b),
+            ParseState::Osc => self.osc_byte(grid, b),
             ParseState::OscEsc => self.osc_esc_byte(grid, b),
         }
     }
@@ -876,12 +916,12 @@ impl Parser {
                 self.intermediate = 0;
             }
             b']' => {
-                self.state = ParseState::Osc;
+                self.begin_string(true);
             }
             b'P' | b'X' | b'^' | b'_' => {
                 // DCS / SOS / PM / APC — string sequences that share the OSC
                 // terminator (BEL or ST), so the same collector swallows them.
-                self.state = ParseState::Osc;
+                self.begin_string(false);
             }
             b'7' => {
                 grid.save_cursor();
@@ -893,7 +933,7 @@ impl Parser {
             }
             b'c' => {
                 // RIS — reset
-                grid.current_attrs.reset();
+                grid.current_attrs = CellAttrs::default();
                 grid.set_cursor(0, 0);
                 grid.erase_in_display(2);
                 self.state = ParseState::Ground;
@@ -1236,13 +1276,20 @@ impl Parser {
         }
     }
 
-    fn osc_byte(&mut self, b: u8) {
-        // Buffer the body until BEL or ST, then drop it. We render no
-        // OSC (window title, hyperlinks, iTerm sequences); buffering just
-        // keeps the payload bytes from leaking into the grid as text.
+    fn begin_string(&mut self, is_command: bool) {
+        self.state = ParseState::Osc;
+        self.osc_buf.clear();
+        self.osc_overflow = false;
+        self.osc_is_command = is_command;
+    }
+
+    fn osc_byte(&mut self, grid: &mut Grid, b: u8) {
+        // Buffer the body until BEL or ST. Only OSC 8 (hyperlinks) is acted
+        // on; window titles, iTerm sequences and DCS bodies are dropped, and
+        // buffering keeps their payload bytes from leaking into the grid.
         match b {
             0x07 => {
-                self.osc_buf.clear();
+                self.dispatch_osc(grid);
                 self.state = ParseState::Ground;
             }
             // ESC starts the two-byte ST terminator; the `\` must be consumed
@@ -1251,15 +1298,40 @@ impl Parser {
             _ => {
                 if self.osc_buf.len() < OSC_BUF_LIMIT {
                     self.osc_buf.push(b);
+                } else {
+                    self.osc_overflow = true;
                 }
             }
         }
     }
 
+    /// Act on a completed OSC. `ESC ] 8 ; params ; uri ST` opens a hyperlink
+    /// that every following cell carries until one with an empty uri closes
+    /// it.
+    fn dispatch_osc(&mut self, grid: &mut Grid) {
+        if !self.osc_is_command || self.osc_overflow {
+            return;
+        }
+        let Some(rest) = self.osc_buf.strip_prefix(b"8;") else {
+            return;
+        };
+        let Ok(rest) = std::str::from_utf8(rest) else {
+            return;
+        };
+        let Some((_params, uri)) = rest.split_once(';') else {
+            return;
+        };
+        grid.current_attrs.link = if uri.is_empty() {
+            0
+        } else {
+            grid.intern_link(uri)
+        };
+    }
+
     fn osc_esc_byte(&mut self, grid: &mut Grid, b: u8) {
-        self.osc_buf.clear();
         if b == b'\\' {
             // ST — string complete.
+            self.dispatch_osc(grid);
             self.state = ParseState::Ground;
         } else {
             // A bare ESC inside the body aborts the string; the byte after it
@@ -1744,6 +1816,44 @@ mod tests {
             b"PR \x1b]8;;https://example.com/pull/232\x1b\\#232\x1b]8;;\x1b\\!",
         );
         assert_eq!(row_text(&g, 0), "PR #232!");
+        let link = g.cell(0, 3).attrs.link;
+        assert_eq!(g.link(link), Some("https://example.com/pull/232"));
+        assert_eq!(g.cell(0, 6).attrs.link, link);
+        assert_eq!(g.cell(0, 2).attrs.link, 0);
+        assert_eq!(g.cell(0, 7).attrs.link, 0);
+    }
+
+    #[test]
+    fn osc8_link_survives_sgr_reset_inside_the_label() {
+        let mut p = Parser::new();
+        let mut g = Grid::new(40, 5);
+        feed(
+            &mut p,
+            &mut g,
+            b"\x1b]8;id=1;https://a.example\x07\x1b[1mab\x1b[0mcd\x1b]8;;\x07e",
+        );
+        let link = g.cell(0, 0).attrs.link;
+        assert_eq!(g.link(link), Some("https://a.example"));
+        assert_eq!(g.cell(0, 3).attrs.link, link);
+        assert_eq!(g.cell(0, 4).attrs.link, 0);
+    }
+
+    #[test]
+    fn repeated_osc8_targets_share_one_link_entry() {
+        let mut p = Parser::new();
+        let mut g = Grid::new(40, 5);
+        let one = b"\x1b]8;;https://a.example\x1b\\x\x1b]8;;\x1b\\ ";
+        feed(&mut p, &mut g, one);
+        feed(&mut p, &mut g, one);
+        assert_eq!(g.cell(0, 0).attrs.link, g.cell(0, 2).attrs.link);
+    }
+
+    #[test]
+    fn dcs_body_never_opens_a_link() {
+        let mut p = Parser::new();
+        let mut g = Grid::new(40, 5);
+        feed(&mut p, &mut g, b"\x1bP8;;https://a.example\x1b\\ok");
+        assert_eq!(g.cell(0, 0).attrs.link, 0);
     }
 
     #[test]

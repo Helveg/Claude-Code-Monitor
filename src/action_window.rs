@@ -1624,6 +1624,22 @@ fn point_in(rect: &RECT, x: i32, y: i32) -> bool {
     x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
 }
 
+/// Re-run WM_SETCURSOR for a pointer that hasn't moved. Windows only asks on
+/// mouse movement, but the cursor over a terminal link depends on Ctrl too,
+/// so pressing or releasing it has to ask again.
+unsafe fn refresh_cursor(hwnd: HWND) {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() || WindowFromPoint(pt) != hwnd {
+        return;
+    }
+    SendMessageW(
+        hwnd,
+        WM_SETCURSOR,
+        WPARAM(hwnd.0 as usize),
+        LPARAM(HTCLIENT as isize | ((WM_MOUSEMOVE as isize) << 16)),
+    );
+}
+
 /// System sizing cursor for one of the grid handles' hints. The non-sizing
 /// hints never reach here — they have cursors of their own.
 unsafe fn size_cursor(hint: dashboard::CursorHint) -> HCURSOR {
@@ -2610,9 +2626,16 @@ unsafe extern "system" fn panel_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_KEYUP | WM_SYSKEYUP if wparam.0 as u32 == VK_CONTROL.0 as u32 => {
+            refresh_cursor(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let vk = wparam.0 as u32;
             let alt_held = msg == WM_SYSKEYDOWN;
+            if vk == VK_CONTROL.0 as u32 {
+                refresh_cursor(hwnd);
+            }
             // Alt+F4 and Alt+Space are the shell's, not the session's.
             if alt_held && (vk == VK_F4.0 as u32 || vk == VK_SPACE.0 as u32) {
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
