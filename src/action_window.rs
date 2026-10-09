@@ -463,7 +463,13 @@ impl Panel {
     fn recompute_layout(&mut self, hwnd: HWND) {
         let area = current_sessions_area(hwnd);
         let dpi = unsafe { GetDpiForWindow(hwnd).max(96) };
-        let tree = projects::build_tree(&self.projects, &self.sessions, &self.hidden_projects);
+        let home = dirs::home_dir();
+        let tree = projects::build_tree(
+            &self.projects,
+            &self.sessions,
+            &self.hidden_projects,
+            home.as_deref(),
+        );
         // Flagged sessions are read off the whole tree: a filter narrows
         // what you're looking for, it shouldn't hide something asking for
         // you.
@@ -924,10 +930,7 @@ impl Panel {
     /// the transcript scanner picks up the conversation's opening prompt,
     /// which the nav then shows instead.
     fn session_name_for(&self, cwd: &Path) -> String {
-        let base = cwd
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| cwd.to_string_lossy().to_string());
+        let base = projects::display_name(cwd);
         let existing = self
             .sessions
             .iter()

@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! Projects                          ⌕  New
+//! ▸ This machine                        3  +
 //! ▾ Claude-Code-Monitor                    +
 //!   ● turn the nav into a project tree
 //!   ○ cleaned up terminal code
@@ -15,7 +16,9 @@
 //! hollow dot is a conversation from the transcript history — clicking it
 //! resumes it into a new terminal. The `+` on a project row starts a fresh
 //! session in that directory; hovering the row also shows a `×` beside it
-//! that removes the project from the nav. Every live session is listed, but only the
+//! that removes the project from the nav. The home directory is pinned
+//! first as "This machine" — a `+` for one-off sessions that belong to no
+//! project — and has no `×`. Every live session is listed, but only the
 //! [`HISTORY_PREVIEW`] most recent conversations — the rest wait behind the
 //! "show more" row, so a directory with hundreds of transcripts still opens
 //! to something readable.
@@ -146,7 +149,8 @@ enum RowKind<'a> {
         expanded: bool,
         children: usize,
         /// Whether the row offers its `×`. A project with sessions in the
-        /// workspace can't be removed: they would only bring it back.
+        /// workspace can't be removed: they would only bring it back. Nor
+        /// can the pinned home row.
         removable: bool,
     },
     Live {
@@ -218,7 +222,7 @@ fn rows<'a>(nav: &NavState<'a>, sessions: &Sessions) -> Vec<Row<'a>> {
                 name: node.name.as_str(),
                 expanded: is_expanded,
                 children: node.child_count(),
-                removable: node.live.is_empty(),
+                removable: !node.pinned && node.live.is_empty(),
             },
             height: PROJECT_ROW_H,
         });
@@ -1364,6 +1368,7 @@ mod tests {
                     last_modified: SystemTime::UNIX_EPOCH,
                 })
                 .collect(),
+            pinned: false,
         }
     }
 

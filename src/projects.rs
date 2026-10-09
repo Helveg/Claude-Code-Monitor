@@ -376,7 +376,20 @@ pub fn path_key(path: &Path) -> String {
     s.trim_end_matches('\\').to_lowercase()
 }
 
-fn display_name(path: &Path) -> String {
+/// Nav label for the user's home directory. Sessions there aren't about
+/// any one project — it's where one-off "on this machine" work runs.
+pub const HOME_NAME: &str = "This machine";
+
+fn is_home(path: &Path) -> bool {
+    dirs::home_dir().is_some_and(|home| path_key(&home) == path_key(path))
+}
+
+/// Label for a project directory: its last path component, or
+/// [`HOME_NAME`] for the home directory.
+pub fn display_name(path: &Path) -> String {
+    if is_home(path) {
+        return HOME_NAME.to_string();
+    }
     path.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string())
@@ -523,6 +536,10 @@ pub struct ProjectNode {
     pub name: String,
     pub live: Vec<LiveRow>,
     pub history: Vec<HistorySession>,
+    /// Held at the top of the nav and never removable — the home
+    /// directory, always on offer for a session that isn't tied to a
+    /// project.
+    pub pinned: bool,
 }
 
 impl ProjectNode {
@@ -544,18 +561,49 @@ impl ProjectNode {
 /// Projects in `hidden` are left out, history and all. A live session
 /// still brings its project back as a bare row of its own, so nothing the
 /// manager is running ever disappears from the nav.
-pub fn build_tree(projects: &[Project], sessions: &Sessions, hidden: &[PathBuf]) -> Vec<ProjectNode> {
+///
+/// `home`, when given, is pinned as the first node whether or not claude
+/// has run there yet, and can't be hidden.
+pub fn build_tree(
+    projects: &[Project],
+    sessions: &Sessions,
+    hidden: &[PathBuf],
+    home: Option<&Path>,
+) -> Vec<ProjectNode> {
     let hidden: HashSet<String> = hidden.iter().map(|p| path_key(p)).collect();
+    let home_key = home.map(path_key);
     let mut nodes: Vec<ProjectNode> = projects
         .iter()
-        .filter(|p| !hidden.contains(&path_key(&p.path)))
+        .filter(|p| {
+            let key = path_key(&p.path);
+            home_key.as_ref() != Some(&key) && !hidden.contains(&key)
+        })
         .map(|p| ProjectNode {
             path: p.path.clone(),
             name: p.name.clone(),
             live: Vec::new(),
             history: p.sessions.clone(),
+            pinned: false,
         })
         .collect();
+    if let Some(home) = home {
+        let key = path_key(home);
+        let history = projects
+            .iter()
+            .find(|p| path_key(&p.path) == key)
+            .map(|p| p.sessions.clone())
+            .unwrap_or_default();
+        nodes.insert(
+            0,
+            ProjectNode {
+                path: home.to_path_buf(),
+                name: HOME_NAME.to_string(),
+                live: Vec::new(),
+                history,
+                pinned: true,
+            },
+        );
+    }
 
     for session in sessions.iter() {
         let Some(cwd) = session.cwd.as_ref() else {
@@ -570,6 +618,7 @@ pub fn build_tree(projects: &[Project], sessions: &Sessions, hidden: &[PathBuf])
                     name: display_name(cwd),
                     live: Vec::new(),
                     history: Vec::new(),
+                    pinned: false,
                 };
                 let at = insert_position(&nodes, &node);
                 nodes.insert(at, node);
@@ -621,12 +670,13 @@ pub fn filter_tree(tree: Vec<ProjectNode>, query: &str) -> Vec<ProjectNode> {
         .collect()
 }
 
-/// Where `node` belongs in an already name-ordered node list.
+/// Where `node` belongs in an already name-ordered node list, below any
+/// pinned nodes at its head.
 fn insert_position(nodes: &[ProjectNode], node: &ProjectNode) -> usize {
     let order = (node.name.to_lowercase(), path_key(&node.path));
     nodes
         .iter()
-        .position(|n| (n.name.to_lowercase(), path_key(&n.path)) > order)
+        .position(|n| !n.pinned && (n.name.to_lowercase(), path_key(&n.path)) > order)
         .unwrap_or(nodes.len())
 }
 
@@ -709,6 +759,7 @@ mod tests {
             name: name.to_string(),
             live: Vec::new(),
             history: Vec::new(),
+            pinned: false,
         };
         let nodes = vec![node("athena"), node("beehive"), node("prismarine")];
         assert_eq!(insert_position(&nodes, &node("aardvark")), 0);
@@ -737,6 +788,7 @@ mod tests {
                     last_modified: SystemTime::UNIX_EPOCH,
                 })
                 .collect(),
+            pinned: false,
         }
     }
 
@@ -758,7 +810,7 @@ mod tests {
         );
         sessions.add("fix the queue", view, Some(cwd), "id-1".to_string());
 
-        let tree = build_tree(&[], &sessions, &[]);
+        let tree = build_tree(&[], &sessions, &[], None);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].live.len(), 1);
         assert!(tree[0].live[0].dormant);
@@ -773,9 +825,55 @@ mod tests {
         ];
         let sessions = Sessions::new();
         // Matched the way Windows matches paths: case and separators folded.
-        let tree = build_tree(&projects, &sessions, &[PathBuf::from("c:/GIT/beehive/")]);
+        let tree = build_tree(&projects, &sessions, &[PathBuf::from("c:/GIT/beehive/")], None);
         let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, ["athena"]);
+    }
+
+    #[test]
+    fn home_is_pinned_first_with_its_history_and_cannot_be_hidden() {
+        let home = PathBuf::from("C:\\Users\\robin");
+        let mut at_home = project("robin", "C:\\Users\\robin", 2);
+        at_home.sessions = (0..2)
+            .map(|i| HistorySession {
+                session_id: format!("id-{i}"),
+                title: format!("one-off {i}"),
+                last_modified: SystemTime::UNIX_EPOCH,
+            })
+            .collect();
+        let projects = vec![project("athena", "C:\\git\\athena", 1), at_home];
+        let tree = build_tree(
+            &projects,
+            &Sessions::new(),
+            &[PathBuf::from("c:/users/robin")],
+            Some(&home),
+        );
+        let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, [HOME_NAME, "athena"]);
+        assert!(tree[0].pinned);
+        assert_eq!(tree[0].history.len(), 2);
+    }
+
+    #[test]
+    fn home_is_offered_before_claude_has_ever_run_there() {
+        let home = PathBuf::from("C:\\Users\\robin");
+        let tree = build_tree(&[], &Sessions::new(), &[], Some(&home));
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].path, home);
+        assert_eq!(tree[0].child_count(), 0);
+    }
+
+    #[test]
+    fn a_new_project_slots_in_below_the_pinned_home() {
+        let node = |name: &str, path: &str, pinned: bool| ProjectNode {
+            path: PathBuf::from(path),
+            name: name.to_string(),
+            live: Vec::new(),
+            history: Vec::new(),
+            pinned,
+        };
+        let nodes = vec![node(HOME_NAME, "C:\\Users\\robin", true)];
+        assert_eq!(insert_position(&nodes, &node("aardvark", "C:\\git\\aardvark", false)), 1);
     }
 
     #[test]
