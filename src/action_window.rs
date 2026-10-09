@@ -125,6 +125,9 @@ struct Panel {
     /// Nav row under the cursor. Drives the row wash and the `+` glyph's
     /// hover colour.
     hovered_nav: Option<NavTarget>,
+    /// Project whose trash can was clicked and is asking "Remove?". Cleared
+    /// as soon as the cursor leaves that project's row.
+    armed_remove: Option<PathBuf>,
     /// Cached output of `dashboard::layout` — recomputed when the view
     /// changes or the panel resizes. Used by the input router so it doesn't
     /// have to re-run layout per event.
@@ -424,6 +427,7 @@ pub fn open_panel() {
             hidden_projects: crate::window::saved_hidden_projects(),
             nav_scroll_y: 0,
             hovered_nav: None,
+            armed_remove: None,
             layout_cache: Vec::new(),
             dragging_session: None,
             attention_queue: VecDeque::new(),
@@ -515,6 +519,7 @@ impl Panel {
             history_expanded: &self.expanded_history,
             scroll_y: self.nav_scroll_y,
             hovered: self.hovered_nav,
+            armed_remove: self.armed_remove.as_deref(),
             search: self.search.nav(),
         }
     }
@@ -656,10 +661,21 @@ impl Panel {
                 }
                 self.expanded_projects.remove(&path);
                 self.expanded_history.remove(&path);
+                self.armed_remove = None;
                 // Indices shift under the cursor; the next mouse move finds
                 // whichever row slid into place.
                 self.hovered_nav = None;
                 self.recompute_layout(hwnd);
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            dashboard::TileAction::ToggleRemoveConfirm(path) => {
+                if self.armed_remove.as_ref() == Some(&path) {
+                    self.armed_remove = None;
+                } else {
+                    self.armed_remove = Some(path);
+                }
                 unsafe {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
@@ -2031,6 +2047,23 @@ unsafe extern "system" fn panel_wnd_proc(
                 if nav_hit != panel.hovered_nav {
                     panel.hovered_nav = nav_hit;
                     let _ = InvalidateRect(hwnd, None, false);
+                }
+
+                // "Remove?" only stands while the cursor stays on its row.
+                if let Some(armed) = &panel.armed_remove {
+                    let on_row = match nav_hit {
+                        Some(
+                            NavTarget::Project(i)
+                            | NavTarget::NewSession(i)
+                            | NavTarget::RemoveProject(i)
+                            | NavTarget::ConfirmRemove(i),
+                        ) => panel.nav_tree.get(i).is_some_and(|n| &n.path == armed),
+                        _ => false,
+                    };
+                    if !on_row {
+                        panel.armed_remove = None;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
                 }
             }
             LRESULT(0)

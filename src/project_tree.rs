@@ -14,8 +14,9 @@
 //! a session this manager is running — clicking it focuses its terminal. A
 //! hollow dot is a conversation from the transcript history — clicking it
 //! resumes it into a new terminal. The `+` on a project row starts a fresh
-//! session in that directory; hovering the row also shows a `×` beside it
-//! that removes the project from the nav. Every live session is listed, but only the
+//! session in that directory; hovering the row also shows a trash can
+//! further left. Clicking it asks "Remove?" beside it, and only clicking
+//! that takes the project out of the nav. Every live session is listed, but only the
 //! [`HISTORY_PREVIEW`] most recent conversations — the rest wait behind the
 //! "show more" row, so a directory with hundreds of transcripts still opens
 //! to something readable.
@@ -62,10 +63,16 @@ const PLUS_STROKE: i32 = 2;
 /// is not a comfortable click target on its own.
 const PLUS_HIT_INFLATE: i32 = 7;
 const COUNT_GAP: i32 = 8;
-/// The `×` that removes a project: same box as the `+`, this far to its
-/// left. Wide enough that the `+`'s inflated hit region, which wins any
-/// overlap, doesn't swallow it.
-const REMOVE_GAP: i32 = 12;
+/// The trash can that removes a project: same box as the `+`, this far to
+/// its left. Wide enough that the two hit regions don't touch, so a click
+/// meant for the `+` can't land on the trash can.
+const REMOVE_GAP: i32 = 24;
+/// The "Remove?" confirmation, right-aligned in a box this wide just left
+/// of the trash can. Beside it rather than in its place, so a double-click
+/// on the trash can doesn't arm and confirm in one go.
+const CONFIRM_W: i32 = 52;
+const CONFIRM_GAP: i32 = 6;
+const CONFIRM_LABEL: &str = "Remove?";
 
 /// "New" badge: an outlined pill, no fill — the panel's controls are
 /// strokes and glyphs on the grey, never button chrome.
@@ -108,8 +115,11 @@ pub enum NavTarget {
     Project(usize),
     /// The `+` on a project row — start a session in that directory.
     NewSession(usize),
-    /// The `×` on a project row — remove it from the nav.
+    /// The trash can on a project row — show or dismiss "Remove?".
     RemoveProject(usize),
+    /// The "Remove?" beside an armed trash can — take the project out of
+    /// the nav.
+    ConfirmRemove(usize),
     /// A running session.
     Live(SessionId),
     /// A past conversation: `(project index, index into its history)`.
@@ -145,8 +155,8 @@ enum RowKind<'a> {
         name: &'a str,
         expanded: bool,
         children: usize,
-        /// Whether the row offers its `×`. A project with sessions in the
-        /// workspace can't be removed: they would only bring it back.
+        /// Whether the row offers its trash can. A project with sessions in
+        /// the workspace can't be removed: they would only bring it back.
         removable: bool,
     },
     Live {
@@ -448,7 +458,7 @@ fn plus_rect(row: &RECT, dpi: u32) -> RECT {
     }
 }
 
-/// The `×` glyph's visual rect: the `+`'s box, shifted left of it.
+/// The trash can's visual rect: the `+`'s box, shifted left of it.
 fn remove_rect(row: &RECT, dpi: u32) -> RECT {
     let plus = plus_rect(row, dpi);
     let shift = (plus.right - plus.left) + scaled(REMOVE_GAP, dpi);
@@ -456,6 +466,25 @@ fn remove_rect(row: &RECT, dpi: u32) -> RECT {
         left: plus.left - shift,
         right: plus.right - shift,
         ..plus
+    }
+}
+
+/// The "Remove?" box: the row's full height, left of the trash can.
+fn confirm_rect(row: &RECT, dpi: u32) -> RECT {
+    let right = remove_rect(row, dpi).left - scaled(CONFIRM_GAP, dpi);
+    RECT {
+        left: right - scaled(CONFIRM_W, dpi),
+        top: row.top,
+        right,
+        bottom: row.bottom,
+    }
+}
+
+/// Whether `index`'s trash can has been clicked and is showing "Remove?".
+fn remove_armed(nav: &NavState<'_>, index: usize) -> bool {
+    match (nav.armed_remove, nav.tree.get(index)) {
+        (Some(armed), Some(node)) => armed == node.path.as_path(),
+        _ => false,
     }
 }
 
@@ -533,6 +562,11 @@ pub fn target_at(
                     NavTarget::NewSession(index)
                 } else if removable && contains(&remove, x, y) {
                     NavTarget::RemoveProject(index)
+                } else if removable
+                    && remove_armed(nav, index)
+                    && contains(&confirm_rect(&rect, dpi), x, y)
+                {
+                    NavTarget::ConfirmRemove(index)
                 } else {
                     NavTarget::Project(index)
                 }
@@ -579,7 +613,10 @@ pub fn action_for(target: NavTarget, tree: &[ProjectNode]) -> Option<TileAction>
     match target {
         NavTarget::Project(i) => Some(TileAction::ToggleProject(tree.get(i)?.path.clone())),
         NavTarget::NewSession(i) => Some(TileAction::NewSessionIn(tree.get(i)?.path.clone())),
-        NavTarget::RemoveProject(i) => Some(TileAction::HideProject(tree.get(i)?.path.clone())),
+        NavTarget::RemoveProject(i) => {
+            Some(TileAction::ToggleRemoveConfirm(tree.get(i)?.path.clone()))
+        }
+        NavTarget::ConfirmRemove(i) => Some(TileAction::HideProject(tree.get(i)?.path.clone())),
         NavTarget::Live(id) | NavTarget::Attention(id) => Some(TileAction::FocusSession(id)),
         NavTarget::History(pi, hi) => {
             let node = tree.get(pi)?;
@@ -789,13 +826,18 @@ pub fn paint(
                 if row_hovered {
                     fill(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX));
                 }
-                // The `×` only shows while the cursor is somewhere on the
-                // row, so a resting nav isn't a column of delete buttons.
+                // The trash can only shows while the cursor is somewhere on
+                // the row, so a resting nav isn't a column of delete buttons.
                 let anywhere_on_row = matches!(
                     nav.hovered,
-                    Some(NavTarget::Project(i) | NavTarget::NewSession(i) | NavTarget::RemoveProject(i))
-                        if i == index
+                    Some(
+                        NavTarget::Project(i)
+                            | NavTarget::NewSession(i)
+                            | NavTarget::RemoveProject(i)
+                            | NavTarget::ConfirmRemove(i)
+                    ) if i == index
                 );
+                let armed = remove_armed(nav, index);
 
                 let chevron_size = scaled(CHEVRON_SIZE, dpi);
                 let chevron_x = rect.left + pad_x;
@@ -813,11 +855,30 @@ pub fn paint(
                 paint_plus(hdc, &plus, plus_hovered, dpi);
 
                 let mut controls_left = plus.left;
-                if removable && anywhere_on_row {
+                if removable && (anywhere_on_row || armed) {
                     let remove = remove_rect(&rect, dpi);
                     let remove_hovered = nav.hovered == Some(NavTarget::RemoveProject(index));
-                    paint_cross(hdc, &remove, remove_hovered, dpi);
+                    paint_trash(hdc, &remove, remove_hovered || armed, dpi);
                     controls_left = remove.left;
+                    if armed {
+                        let confirm = confirm_rect(&rect, dpi);
+                        let confirm_hovered =
+                            nav.hovered == Some(NavTarget::ConfirmRemove(index));
+                        let old = unsafe { SelectObject(hdc, count_font) };
+                        draw_text(
+                            hdc,
+                            CONFIRM_LABEL,
+                            confirm,
+                            Color::from_hex(if confirm_hovered {
+                                PROJECT_FG_HEX
+                            } else {
+                                ORANGE_HEX
+                            }),
+                            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                        );
+                        unsafe { SelectObject(hdc, old) };
+                        controls_left = confirm.left;
+                    }
                 }
 
                 // Child count sits left of the row's glyphs, and only when
@@ -1286,30 +1347,42 @@ fn paint_plus(hdc: HDC, rect: &RECT, hovered: bool, dpi: u32) {
     );
 }
 
-/// Two diagonal strokes, inset so the `×` reads as the same size as the
-/// `+` beside it (a diagonal spans more of its box than an upright arm).
-/// Orange while hovered, like the `+`.
-fn paint_cross(hdc: HDC, rect: &RECT, hovered: bool, dpi: u32) {
-    let color = if hovered {
+/// A trash can in thin strokes: a handle over a lid spanning the box, and
+/// a body tapering slightly to its base. Lighter than the `+` so the two
+/// never read as the same kind of control. Orange while hovered or showing
+/// "Remove?".
+fn paint_trash(hdc: HDC, rect: &RECT, active: bool, dpi: u32) {
+    let color = if active {
         Color::from_hex(ORANGE_HEX)
     } else {
         Color::from_hex(META_FG_HEX)
     };
-    let stroke = scaled(PLUS_STROKE, dpi).max(1);
-    let inset = (rect.right - rect.left) / 8;
-    let (l, t, r, b) = (
-        rect.left + inset,
-        rect.top + inset,
-        rect.right - inset,
-        rect.bottom - inset,
-    );
+    let stroke = scaled(1, dpi).max(1);
+    let w = rect.right - rect.left;
+    let h = rect.bottom - rect.top;
+    let lid_y = rect.top + h / 5;
+    let handle_inset = w * 3 / 10;
+    let body_inset = w / 8;
+    let taper = w / 10;
+    let body = [
+        POINT { x: rect.left + body_inset, y: lid_y },
+        POINT { x: rect.left + body_inset + taper, y: rect.bottom },
+        POINT { x: rect.right - body_inset - taper, y: rect.bottom },
+        POINT { x: rect.right - body_inset, y: lid_y },
+    ];
+    let handle = [
+        POINT { x: rect.left + handle_inset, y: lid_y },
+        POINT { x: rect.left + handle_inset, y: rect.top },
+        POINT { x: rect.right - handle_inset, y: rect.top },
+        POINT { x: rect.right - handle_inset, y: lid_y },
+    ];
     unsafe {
         let pen = CreatePen(PS_SOLID, stroke, COLORREF(color.to_colorref()));
         let old_pen = SelectObject(hdc, pen);
-        let _ = MoveToEx(hdc, l, t, None);
-        let _ = LineTo(hdc, r, b);
-        let _ = MoveToEx(hdc, r, t, None);
-        let _ = LineTo(hdc, l, b);
+        let _ = MoveToEx(hdc, rect.left, lid_y, None);
+        let _ = LineTo(hdc, rect.right, lid_y);
+        let _ = Polyline(hdc, &body);
+        let _ = Polyline(hdc, &handle);
         SelectObject(hdc, old_pen);
         let _ = DeleteObject(pen);
     }
@@ -1417,6 +1490,7 @@ mod tests {
             history_expanded: &EMPTY_PATHS,
             scroll_y,
             hovered: None,
+            armed_remove: None,
             search: NavSearch::default(),
         }
     }
@@ -1840,14 +1914,14 @@ mod tests {
         ));
     }
 
-    /// The `×` sits left of the `+` and removes the project — but only on a
-    /// project with nothing in the workspace.
+    /// The trash can sits left of the `+` and asks before removing — and
+    /// only on a project with nothing in the workspace.
     #[test]
-    fn the_cross_removes_an_idle_project() {
+    fn the_trash_can_removes_an_idle_project_after_confirming() {
         let bounds = tile();
         let tree = vec![node("a", 0, 1), node("b", 1, 0)];
         let expanded = HashSet::new();
-        let nav = nav_state(&tree, &[], &expanded, 0);
+        let mut nav = nav_state(&tree, &[], &expanded, 0);
         let sessions = Sessions::new();
 
         let row = |i: i32| RECT {
@@ -1863,15 +1937,42 @@ mod tests {
             target_at(x, y, bounds, 96, &nav, &sessions),
             Some(NavTarget::RemoveProject(0))
         );
+        // The first click only asks.
         assert!(matches!(
             action_for(NavTarget::RemoveProject(0), &tree),
-            Some(TileAction::HideProject(p)) if p == tree[0].path
+            Some(TileAction::ToggleRemoveConfirm(p)) if p == tree[0].path
         ));
-        // The `+` keeps its own middle.
+        // The `+` keeps its own middle, and the two hit regions don't touch.
         let (px, py) = mid(plus_rect(&row(0), 96));
         assert_eq!(
             target_at(px, py, bounds, 96, &nav, &sessions),
             Some(NavTarget::NewSession(0))
+        );
+        let grow = scaled(PLUS_HIT_INFLATE, 96);
+        assert!(
+            inflate(remove_rect(&row(0), 96), grow).right
+                <= inflate(plus_rect(&row(0), 96), grow).left
+        );
+
+        // "Remove?" is only a target once armed, and only on its own row.
+        let (cx, cy) = mid(confirm_rect(&row(0), 96));
+        assert_eq!(
+            target_at(cx, cy, bounds, 96, &nav, &sessions),
+            Some(NavTarget::Project(0))
+        );
+        nav.armed_remove = Some(tree[0].path.as_path());
+        assert_eq!(
+            target_at(cx, cy, bounds, 96, &nav, &sessions),
+            Some(NavTarget::ConfirmRemove(0))
+        );
+        assert!(matches!(
+            action_for(NavTarget::ConfirmRemove(0), &tree),
+            Some(TileAction::HideProject(p)) if p == tree[0].path
+        ));
+        let (cx, cy) = mid(confirm_rect(&row(1), 96));
+        assert_eq!(
+            target_at(cx, cy, bounds, 96, &nav, &sessions),
+            Some(NavTarget::Project(1))
         );
 
         let (x, y) = mid(remove_rect(&row(1), 96));
