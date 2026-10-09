@@ -179,6 +179,122 @@ impl Color {
     }
 }
 
+/// Optical size of Segoe UI Variable to set a run of text in. Display is cut
+/// for headings, Small for 8 pt and below, Text for everything between.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UiFace {
+    Display,
+    Text,
+    Small,
+}
+
+impl UiFace {
+    fn face_name(self) -> &'static str {
+        match self {
+            UiFace::Display => "Segoe UI Variable Display",
+            UiFace::Text => "Segoe UI Variable Text",
+            UiFace::Small => "Segoe UI Variable Small",
+        }
+    }
+}
+
+/// True when GDI resolves `face` to itself rather than substituting another
+/// family for it. Asked once per name; fonts don't come and go mid-session
+/// often enough to matter.
+fn face_installed(face: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::Graphics::Gdi::{
+        CreateFontW, DeleteObject, GetDC, GetTextFaceW, ReleaseDC, SelectObject,
+    };
+
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(face) {
+        return *known;
+    }
+    let wide = wide_str(face);
+    let installed = unsafe {
+        let dc = GetDC(HWND::default());
+        let font = CreateFontW(
+            -12,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            PCWSTR::from_raw(wide.as_ptr()),
+        );
+        let old = SelectObject(dc, font);
+        let mut buf = [0u16; 64];
+        let len = GetTextFaceW(dc, Some(&mut buf)) as usize;
+        SelectObject(dc, old);
+        let _ = DeleteObject(font);
+        ReleaseDC(HWND::default(), dc);
+        let got = String::from_utf16_lossy(&buf[..len.saturating_sub(1).min(buf.len())]);
+        got.eq_ignore_ascii_case(face)
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(face.to_string(), installed);
+    installed
+}
+
+fn create_font(height: i32, weight: i32, face: &str) -> windows::Win32::Graphics::Gdi::HFONT {
+    use windows::Win32::Graphics::Gdi::*;
+    let wide = wide_str(face);
+    unsafe {
+        CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(wide.as_ptr()),
+        )
+    }
+}
+
+/// The panel's UI typeface: Segoe UI Variable at the optical size asked for,
+/// or plain Segoe UI where the variable family isn't installed (Windows 10).
+/// The caller owns the returned font and deletes it.
+pub fn ui_font(dpi: u32, point_size: i32, weight: i32, face: UiFace) -> windows::Win32::Graphics::Gdi::HFONT {
+    let name = if face_installed(face.face_name()) {
+        face.face_name()
+    } else {
+        "Segoe UI"
+    };
+    create_font(-(point_size * dpi as i32 / 72), weight, name)
+}
+
+/// Windows' own glyph font for window chrome — Segoe Fluent Icons on
+/// Windows 11, Segoe MDL2 Assets before it; both put the caption glyphs at
+/// the same code points. `px` is the em height in device pixels.
+pub fn icon_font(px: i32) -> windows::Win32::Graphics::Gdi::HFONT {
+    let name = if face_installed("Segoe Fluent Icons") {
+        "Segoe Fluent Icons"
+    } else {
+        "Segoe MDL2 Assets"
+    };
+    create_font(-px, 400, name)
+}
+
 /// The system I-beam, made solid white instead of screen-inverting.
 ///
 /// `IDC_IBEAM` is drawn entirely out of invert-the-screen pixels, which is why

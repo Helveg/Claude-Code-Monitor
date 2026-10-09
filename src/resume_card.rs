@@ -469,25 +469,12 @@ fn draw_text_centered(hdc: HDC, text: &str, rect: &RECT, color: Color) {
 }
 
 fn make_font(dpi: u32, point_size: i32, weight: i32) -> HFONT {
-    let face = native_interop::wide_str("Segoe UI");
-    unsafe {
-        CreateFontW(
-            -(point_size * dpi as i32 / 72),
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(face.as_ptr()),
-        )
-    }
+    let face = if point_size <= 8 {
+        native_interop::UiFace::Small
+    } else {
+        native_interop::UiFace::Text
+    };
+    native_interop::ui_font(dpi, point_size, weight, face)
 }
 
 fn draw_text(hdc: HDC, text: &str, rect: RECT, color: Color, flags: DRAW_TEXT_FORMAT) {

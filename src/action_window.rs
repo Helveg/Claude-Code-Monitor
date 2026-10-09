@@ -1,9 +1,14 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE,
+};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -16,14 +21,15 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_F4, VK_RMENU,
-    VK_SPACE,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT,
+    TRACKMOUSEEVENT, VK_CONTROL, VK_ESCAPE, VK_F4, VK_RMENU, VK_SPACE,
 };
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::dashboard::{self, NavState, PanelView};
 use crate::grid_tile::{self, MAX_GRID};
-use crate::native_interop::{self, Color};
+use crate::native_interop::{self, Color, UiFace};
 use crate::project_tree::{self, NavTarget};
 use crate::projects::{self, Project, ProjectNode};
 use crate::session_view::SessionView;
@@ -35,34 +41,62 @@ const PANEL_CLASS: &str = "ClaudeManagerPanel";
 
 const PANEL_W: i32 = 900;
 const PANEL_H: i32 = 600;
-const CHROME_BUTTON_SIZE: i32 = 7;
-const CHROME_BUTTON_MARGIN: i32 = 10;
-const CHROME_BUTTON_GAP: i32 = 8;
-const CHROME_STROKE: i32 = 2;
+/// The frame is a dark rail: the caption band across the top and a thin
+/// margin down the sides and bottom. The panel's content sits inside it on
+/// a rounded layer of Claude grey, so the chrome reads as the window and
+/// the layer as the work. All sizes in design pixels at 96 DPI.
+const CAPTION_H: i32 = 40;
+const FRAME_INSET: i32 = 6;
+const LAYER_RADIUS: i32 = 8;
+const LAYER_PAD: i32 = 10;
 
-const CAPTION_STRIP: i32 = 26;
-const PANEL_PAD_X: i32 = 12;
-const PANEL_PAD_TOP: i32 = 30;
-const PANEL_PAD_BOTTOM: i32 = 12;
+/// Caption buttons use the system's slot size so they line up with every
+/// other window's, glyphs and all.
+const CAPTION_BUTTON_W: i32 = 46;
+const CAPTION_GLYPH_PX: i32 = 10;
+const GLYPH_MINIMIZE: char = '\u{E921}';
+const GLYPH_MAXIMIZE: char = '\u{E922}';
+const GLYPH_RESTORE: char = '\u{E923}';
+const GLYPH_CLOSE: char = '\u{E8BB}';
 
-/// Quota bars mirrored from the taskbar widget into the caption strip, to
-/// the left of the chrome buttons. Sized to sit level with those buttons
-/// rather than to match the widget pixel for pixel.
-const QUOTA_SEG_W: i32 = 7;
+/// App mark, name and the view tabs, left to right from the rail's edge.
+const BRAND_X: i32 = 14;
+const BRAND_ICON: i32 = 16;
+const BRAND_ICON_GAP: i32 = 9;
+const BRAND_TAB_GAP: i32 = 22;
+const BRAND_FONT_PT: i32 = 10;
+const TAB_PAD_X: i32 = 10;
+const TAB_GAP: i32 = 2;
+const TAB_H: i32 = 28;
+const TAB_FONT_PT: i32 = 10;
+/// The active tab's marker: a short pill under its label, the same shape
+/// Windows uses to mark the selected item in a navigation list.
+const TAB_MARK_W: i32 = 16;
+const TAB_MARK_H: i32 = 3;
+
+/// Quota bars mirrored from the taskbar widget into the caption, to the
+/// left of the caption buttons.
+const QUOTA_SEG_W: i32 = 6;
 const QUOTA_SEG_H: i32 = 10;
-const QUOTA_SEG_GAP: i32 = 1;
+const QUOTA_SEG_GAP: i32 = 2;
 const QUOTA_SEG_COUNT: i32 = 10;
 const QUOTA_CORNER: i32 = 2;
-const QUOTA_LABEL_GAP: i32 = 5;
-const QUOTA_TEXT_GAP: i32 = 6;
-const QUOTA_BLOCK_GAP: i32 = 18;
-const QUOTA_BUTTON_GAP: i32 = 16;
-const QUOTA_FONT_PT: i32 = 8;
-const QUOTA_TRACK_HEX: &str = "#45443F";
-const QUOTA_FG_HEX: &str = "#8A847C";
+const QUOTA_LABEL_GAP: i32 = 7;
+const QUOTA_TEXT_GAP: i32 = 7;
+const QUOTA_BLOCK_GAP: i32 = 20;
+const QUOTA_BUTTON_GAP: i32 = 14;
+const QUOTA_FONT_PT: i32 = 9;
+const QUOTA_TRACK_HEX: &str = "#3A3935";
 
 const ORANGE_HEX: &str = "#D97757";
 const CLAUDE_GREY_HEX: &str = "#262624";
+const RAIL_HEX: &str = "#1B1B19";
+const LAYER_STROKE_HEX: &str = "#34332F";
+/// Caption text and glyphs: `INK` for what is active or hovered, `MUTED`
+/// for the rest, `FAINT` for all of it while the window is inactive.
+const INK_HEX: &str = "#ECE9E4";
+const MUTED_HEX: &str = "#9A948C";
+const FAINT_HEX: &str = "#5F5B55";
 
 /// Grid-size picker: a `MAX_GRID x MAX_GRID` sheet of cells hanging off the
 /// view button. Hovering paints the top-left block the cursor spans; the
@@ -160,6 +194,8 @@ struct Panel {
     /// Session control under the cursor — a cell's close cross, or a resume
     /// card's button. Drives their hover colour.
     hovered_control: Option<(SessionId, dashboard::SlotControl)>,
+    /// Caption control under the cursor. Lights its glyph or label.
+    hovered_chrome: Option<ChromeHit>,
     /// Point size the terminals render at. Ctrl +/- walks it; the grid's
     /// cells follow one size smaller.
     font_pt: i32,
@@ -356,6 +392,7 @@ pub fn open_panel() {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
+        apply_dwm_frame(hwnd);
 
         *PANEL_HWND.lock().unwrap_or_else(|e| e.into_inner()) = hwnd.0 as isize;
 
@@ -437,6 +474,7 @@ pub fn open_panel() {
             search: SearchState::default(),
             search_timer_on: false,
             hovered_control: None,
+            hovered_chrome: None,
             font_pt: crate::window::saved_font_pt(),
         };
         panel.recompute_layout(hwnd);
@@ -1310,6 +1348,36 @@ fn project_shape(projects: &[Project]) -> Vec<(&Path, Vec<(&str, &str)>)> {
         .collect()
 }
 
+/// Ask DWM for the Windows 11 frame around the panel's own chrome: rounded
+/// corners, the dark variant of its shadow and system menus, and a window
+/// edge in the rail's hairline colour instead of the accent. Each attribute
+/// is ignored by Windows versions that predate it.
+fn apply_dwm_frame(hwnd: HWND) {
+    let dark: i32 = 1;
+    let corners = DWMWCP_ROUND;
+    let border = Color::from_hex(LAYER_STROKE_HEX).to_colorref();
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corners as *const DWM_WINDOW_CORNER_PREFERENCE as *const _,
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
 fn system_dpi_scale() -> f64 {
     unsafe {
         let dc = GetDC(HWND::default());
@@ -1326,57 +1394,160 @@ fn system_dpi_scale() -> f64 {
     }
 }
 
-/// Button visuals, ordered right-to-left as [close, maximize, minimize,
-/// view]. Each button is `CHROME_BUTTON_SIZE` square in design pixels.
-fn chrome_button_rects(client: &RECT, dpi: u32) -> [RECT; 4] {
-    let scale = dpi as f64 / 96.0;
-    let size = (CHROME_BUTTON_SIZE as f64 * scale).round() as i32;
-    let margin = (CHROME_BUTTON_MARGIN as f64 * scale).round() as i32;
-    let gap = (CHROME_BUTTON_GAP as f64 * scale).round() as i32;
-    let mut right_edge = client.right - margin;
-    let top = margin;
-    let mut rects = [RECT::default(); 4];
+/// A control in the caption rail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChromeHit {
+    Close,
+    Maximize,
+    Minimize,
+    Tab(ViewTab),
+}
+
+/// The two panel views, as the caption's tabs name them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewTab {
+    Focus,
+    Grid,
+}
+
+impl ViewTab {
+    const ALL: [ViewTab; 2] = [ViewTab::Focus, ViewTab::Grid];
+
+    fn label(self) -> &'static str {
+        match self {
+            ViewTab::Focus => "Focus",
+            ViewTab::Grid => "Grid",
+        }
+    }
+
+    fn view(self) -> PanelView {
+        match self {
+            ViewTab::Focus => PanelView::Dashboard { queue_mode: false },
+            ViewTab::Grid => PanelView::Grid,
+        }
+    }
+
+    fn shows(self, view: &PanelView) -> bool {
+        matches!(
+            (self, view),
+            (ViewTab::Focus, PanelView::Dashboard { .. }) | (ViewTab::Grid, PanelView::Grid)
+        )
+    }
+}
+
+const APP_NAME: &str = "Claude Manager";
+
+/// Whether the panel is the active window. The caption dims while it isn't,
+/// like every other window's title bar.
+static PANEL_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+fn px(design: i32, dpi: u32) -> i32 {
+    (design as f64 * dpi as f64 / 96.0).round() as i32
+}
+
+/// Caption button slots, right to left: [close, maximize, minimize]. Each
+/// runs the full height of the caption and they sit flush in the window's
+/// top-right corner, so flinging the pointer into the corner hits close.
+fn caption_button_rects(client: &RECT, dpi: u32) -> [RECT; 3] {
+    let w = px(CAPTION_BUTTON_W, dpi);
+    let h = px(CAPTION_H, dpi);
+    let mut right = client.right;
+    let mut rects = [RECT::default(); 3];
     for r in rects.iter_mut() {
         *r = RECT {
-            left: right_edge - size,
-            top,
-            right: right_edge,
-            bottom: top + size,
+            left: right - w,
+            top: client.top,
+            right,
+            bottom: client.top + h,
         };
-        right_edge -= size + gap;
+        right -= w;
     }
     rects
 }
 
-/// Hit-test rects — inflated versions of the visual rects so the clickable
-/// area is comfortable. Adjacent hit rects abut (no gap, no overlap).
-fn chrome_button_hit_rects(client: &RECT, dpi: u32) -> [RECT; 4] {
-    let scale = dpi as f64 / 96.0;
-    let inflate = ((CHROME_BUTTON_GAP as f64 / 2.0) * scale).round() as i32;
-    let mut rects = chrome_button_rects(client, dpi);
-    for r in rects.iter_mut() {
-        r.left -= inflate;
-        r.top -= inflate;
-        r.right += inflate;
-        r.bottom += inflate;
+fn brand_icon_rect(client: &RECT, dpi: u32) -> RECT {
+    let size = px(BRAND_ICON, dpi);
+    let left = client.left + px(BRAND_X, dpi);
+    let top = client.top + (px(CAPTION_H, dpi) - size) / 2;
+    RECT {
+        left,
+        top,
+        right: left + size,
+        bottom: top + size,
+    }
+}
+
+/// Width of `text` set in `font`, measured on a scratch DC so hit-testing
+/// can lay the caption out without a paint in progress.
+fn text_width(font: HFONT, text: &str) -> i32 {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE::default();
+    unsafe {
+        let dc = CreateCompatibleDC(HDC::default());
+        let old = SelectObject(dc, font);
+        let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
+        SelectObject(dc, old);
+        let _ = DeleteDC(dc);
+    }
+    size.cx
+}
+
+fn brand_name_rect(client: &RECT, dpi: u32) -> RECT {
+    let icon = brand_icon_rect(client, dpi);
+    let font = native_interop::ui_font(dpi, BRAND_FONT_PT, FW_SEMIBOLD.0 as i32, UiFace::Display);
+    let w = text_width(font, APP_NAME);
+    unsafe {
+        let _ = DeleteObject(font);
+    }
+    let left = icon.right + px(BRAND_ICON_GAP, dpi);
+    RECT {
+        left,
+        top: client.top,
+        right: left + w,
+        bottom: client.top + px(CAPTION_H, dpi),
+    }
+}
+
+/// One rect per tab, in `ViewTab::ALL` order, each its label plus padding.
+fn tab_rects(client: &RECT, dpi: u32) -> [RECT; 2] {
+    let font = native_interop::ui_font(dpi, TAB_FONT_PT, FW_NORMAL.0 as i32, UiFace::Text);
+    let h = px(TAB_H, dpi);
+    let top = client.top + (px(CAPTION_H, dpi) - h) / 2;
+    let mut left = brand_name_rect(client, dpi).right + px(BRAND_TAB_GAP, dpi);
+    let mut rects = [RECT::default(); 2];
+    for (r, tab) in rects.iter_mut().zip(ViewTab::ALL) {
+        let w = text_width(font, tab.label()) + 2 * px(TAB_PAD_X, dpi);
+        *r = RECT {
+            left,
+            top,
+            right: left + w,
+            bottom: top + h,
+        };
+        left += w + px(TAB_GAP, dpi);
+    }
+    unsafe {
+        let _ = DeleteObject(font);
     }
     rects
 }
 
-fn close_button_rect(client: &RECT, dpi: u32) -> RECT {
-    chrome_button_rects(client, dpi)[0]
-}
-
-fn maximize_button_rect(client: &RECT, dpi: u32) -> RECT {
-    chrome_button_rects(client, dpi)[1]
-}
-
-fn minimize_button_rect(client: &RECT, dpi: u32) -> RECT {
-    chrome_button_rects(client, dpi)[2]
-}
-
-fn view_button_rect(client: &RECT, dpi: u32) -> RECT {
-    chrome_button_rects(client, dpi)[3]
+/// The caption control under `(x, y)`, client coordinates.
+fn chrome_hit_at(client: &RECT, dpi: u32, x: i32, y: i32) -> Option<ChromeHit> {
+    let [close, maximize, minimize] = caption_button_rects(client, dpi);
+    if point_in(&close, x, y) {
+        return Some(ChromeHit::Close);
+    }
+    if point_in(&maximize, x, y) {
+        return Some(ChromeHit::Maximize);
+    }
+    if point_in(&minimize, x, y) {
+        return Some(ChromeHit::Minimize);
+    }
+    tab_rects(client, dpi)
+        .iter()
+        .zip(ViewTab::ALL)
+        .find(|(r, _)| point_in(r, x, y))
+        .map(|(_, tab)| ChromeHit::Tab(tab))
 }
 
 fn point_in(rect: &RECT, x: i32, y: i32) -> bool {
@@ -1401,22 +1572,20 @@ fn picker_pitch(dpi: u32) -> i32 {
     ((PICKER_CELL + PICKER_CELL_GAP) as f64 * scale).round() as i32
 }
 
-/// Outer rect of the grid-size picker sheet. It hangs below the view button
-/// and extends leftwards, so the whole sheet stays inside the panel however
-/// narrow the window is.
+/// Outer rect of the grid-size picker sheet. It drops from the Grid tab and
+/// is pulled back leftwards when the window is too narrow to hold it there.
 fn grid_picker_rect(client: &RECT, dpi: u32) -> RECT {
     let scale = dpi as f64 / 96.0;
     let cell = (PICKER_CELL as f64 * scale).round() as i32;
     let pad = (PICKER_PAD as f64 * scale).round() as i32;
     let label = (PICKER_LABEL_H as f64 * scale).round() as i32;
-    let margin = (CHROME_BUTTON_MARGIN as f64 * scale).round() as i32;
+    let margin = px(FRAME_INSET, dpi);
     let matrix = (MAX_GRID - 1) * picker_pitch(dpi) + cell;
     let w = matrix + 2 * pad;
     let h = matrix + 2 * pad + label;
-    let view = view_button_rect(client, dpi);
-    let right = client.right - margin;
-    let left = (right - w).max(client.left + margin);
-    let top = view.bottom + margin;
+    let tab = tab_rects(client, dpi)[1];
+    let left = tab.left.min(client.right - margin - w).max(client.left + margin);
+    let top = tab.bottom + margin;
     RECT {
         left,
         top,
@@ -1520,22 +1689,11 @@ fn paint_grid_picker(
             }
         }
 
-        let face = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
-            -(PICKER_LABEL_FONT_PT * dpi as i32 / 72),
-            0,
-            0,
-            0,
+        let font = native_interop::ui_font(
+            dpi,
+            PICKER_LABEL_FONT_PT,
             FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(face.as_ptr()),
+            UiFace::Small,
         );
         let old_font = SelectObject(hdc, font);
         let _ = SetBkMode(hdc, TRANSPARENT);
@@ -1564,32 +1722,40 @@ fn paint_grid_picker(
 }
 
 fn caption_strip(client: &RECT, dpi: u32) -> RECT {
-    let scale = dpi as f64 / 96.0;
-    let height = (CAPTION_STRIP as f64 * scale).round() as i32;
     RECT {
         left: client.left,
         top: client.top,
         right: client.right,
-        bottom: client.top + height,
+        bottom: client.top + px(CAPTION_H, dpi),
     }
 }
 
-/// The rect inside the panel client area that hosts session views — below
-/// the caption / close button strip and inset for breathing room.
+/// The rounded content layer: everything below the caption, inset from the
+/// window's other three edges by the rail.
+fn layer_rect(client: &RECT, dpi: u32) -> RECT {
+    let inset = px(FRAME_INSET, dpi);
+    RECT {
+        left: client.left + inset,
+        top: client.top + px(CAPTION_H, dpi),
+        right: client.right - inset,
+        bottom: client.bottom - inset,
+    }
+}
+
+/// The rect inside the panel client area that hosts session views — the
+/// content layer, inset for breathing room.
 fn current_sessions_area(hwnd: HWND) -> RECT {
     unsafe {
         let mut client = RECT::default();
         let _ = GetClientRect(hwnd, &mut client);
         let dpi = GetDpiForWindow(hwnd).max(96);
-        let scale = dpi as f64 / 96.0;
-        let pad_x = (PANEL_PAD_X as f64 * scale).round() as i32;
-        let pad_top = (PANEL_PAD_TOP as f64 * scale).round() as i32;
-        let pad_bot = (PANEL_PAD_BOTTOM as f64 * scale).round() as i32;
+        let layer = layer_rect(&client, dpi);
+        let pad = px(LAYER_PAD, dpi);
         RECT {
-            left: client.left + pad_x,
-            top: client.top + pad_top,
-            right: client.right - pad_x,
-            bottom: client.bottom - pad_bot,
+            left: layer.left + pad,
+            top: layer.top + pad,
+            right: layer.right - pad,
+            bottom: layer.bottom - pad,
         }
     }
 }
@@ -1624,7 +1790,63 @@ unsafe extern "system" fn panel_wnd_proc(
         // change, straight over our client area. Claiming the message keeps
         // the panel's own chrome; TRUE is the "frame is active" reply the
         // shell expects.
-        WM_NCACTIVATE => LRESULT(1),
+        WM_NCACTIVATE => {
+            PANEL_ACTIVE.store(wparam.0 != 0, Ordering::Relaxed);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let strip = caption_strip(&client, GetDpiForWindow(hwnd).max(96));
+            let _ = InvalidateRect(hwnd, Some(&strip), false);
+            LRESULT(1)
+        }
+        // The maximize slot is reported as HTMAXBUTTON (see WM_NCHITTEST), so
+        // its hover and clicks come through the non-client messages. Left to
+        // DefWindowProc, the press would paint a classic caption button over
+        // the panel's own; the click is completed on release instead.
+        WM_NCMOUSEMOVE => {
+            let over_max = wparam.0 == HTMAXBUTTON as usize;
+            set_chrome_hover(hwnd, over_max.then_some(ChromeHit::Maximize));
+            if over_max {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE | TME_NONCLIENT,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_NCMOUSELEAVE => {
+            clear_chrome_hover(hwnd, ChromeHit::Maximize);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if wparam.0 == HTMAXBUTTON as usize => LRESULT(0),
+        WM_NCLBUTTONUP if wparam.0 == HTMAXBUTTON as usize => {
+            let cmd = if IsZoomed(hwnd).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_MAXIMIZE
+            };
+            let _ = ShowWindow(hwnd, cmd);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            let mut panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(panel) = panel_guard.as_mut() {
+                let had_hover = panel.hovered_chrome.is_some()
+                    || panel.hovered_nav.is_some()
+                    || panel.hovered_control.is_some();
+                if panel.hovered_chrome != Some(ChromeHit::Maximize) {
+                    panel.hovered_chrome = None;
+                }
+                panel.hovered_nav = None;
+                panel.hovered_control = None;
+                if had_hover {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
         WM_NCHITTEST => {
             let xs = (lparam.0 & 0xFFFF) as i16 as i32;
             let ys = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
@@ -1660,10 +1882,14 @@ unsafe extern "system" fn panel_wnd_proc(
                 }
             }
 
-            for r in chrome_button_hit_rects(&client, dpi).iter() {
-                if point_in(r, pt.x, pt.y) {
-                    return LRESULT(HTCLIENT as isize);
-                }
+            // The maximize slot answers as the system's own maximize button:
+            // that is what makes the shell offer its Snap Layouts flyout on
+            // hover. Its clicks then arrive as non-client messages, handled
+            // below. The other caption controls stay client area.
+            match chrome_hit_at(&client, dpi, pt.x, pt.y) {
+                Some(ChromeHit::Maximize) => return LRESULT(HTMAXBUTTON as isize),
+                Some(_) => return LRESULT(HTCLIENT as isize),
+                None => {}
             }
             let cap = caption_strip(&client, dpi);
             if point_in(&cap, pt.x, pt.y) {
@@ -1681,15 +1907,11 @@ unsafe extern "system" fn panel_wnd_proc(
                 let _ = GetClientRect(hwnd, &mut client);
                 let dpi = GetDpiForWindow(hwnd).max(96);
 
-                // Chrome buttons take precedence — they sit above the
-                // tile area in the caption strip.
-                for r in chrome_button_hit_rects(&client, dpi).iter() {
-                    if point_in(r, pt.x, pt.y) {
-                        let cursor =
-                            LoadCursorW(HINSTANCE::default(), IDC_HAND).unwrap_or_default();
-                        SetCursor(cursor);
-                        return LRESULT(1);
-                    }
+                // Caption controls keep the plain arrow, as title bars do.
+                if chrome_hit_at(&client, dpi, pt.x, pt.y).is_some() {
+                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default();
+                    SetCursor(cursor);
+                    return LRESULT(1);
                 }
 
                 // Per-tile cursor.
@@ -1742,7 +1964,7 @@ unsafe extern "system" fn panel_wnd_proc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
-        // Right-clicking the view button opens the grid-size picker; a
+        // Right-clicking the Grid tab opens the grid-size picker; a
         // right-click anywhere else dismisses it.
         WM_RBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -1750,7 +1972,8 @@ unsafe extern "system" fn panel_wnd_proc(
             let mut client = RECT::default();
             let _ = GetClientRect(hwnd, &mut client);
             let dpi = GetDpiForWindow(hwnd).max(96);
-            let on_view = point_in(&chrome_button_hit_rects(&client, dpi)[3], x, y);
+            let on_view =
+                chrome_hit_at(&client, dpi, x, y) == Some(ChromeHit::Tab(ViewTab::Grid));
             let mut panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(panel) = panel_guard.as_mut() {
                 panel.grid_picker = if on_view && panel.grid_picker.is_none() {
@@ -1791,28 +2014,21 @@ unsafe extern "system" fn panel_wnd_proc(
                 }
             }
 
-            let [close_hit, maximize_hit, minimize_hit, view_hit] =
-                chrome_button_hit_rects(&client, dpi);
-            if point_in(&close_hit, x, y) {
-                let _ = DestroyWindow(hwnd);
-                return LRESULT(0);
-            }
-            if point_in(&maximize_hit, x, y) {
-                let cmd = if IsZoomed(hwnd).as_bool() {
-                    SW_RESTORE
-                } else {
-                    SW_MAXIMIZE
-                };
-                let _ = ShowWindow(hwnd, cmd);
-                return LRESULT(0);
-            }
-            if point_in(&minimize_hit, x, y) {
-                let _ = ShowWindow(hwnd, SW_MINIMIZE);
-                return LRESULT(0);
-            }
-            if point_in(&view_hit, x, y) {
-                cycle_view(hwnd);
-                return LRESULT(0);
+            // Maximize never lands here: it is HTMAXBUTTON, a non-client hit.
+            match chrome_hit_at(&client, dpi, x, y) {
+                Some(ChromeHit::Close) => {
+                    let _ = DestroyWindow(hwnd);
+                    return LRESULT(0);
+                }
+                Some(ChromeHit::Minimize) => {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                    return LRESULT(0);
+                }
+                Some(ChromeHit::Tab(tab)) => {
+                    switch_view(hwnd, tab.view());
+                    return LRESULT(0);
+                }
+                Some(ChromeHit::Maximize) | None => {}
             }
             // Route to whichever tile contains the click. The grid tile is
             // special-cased so we can intercept scrollbar interactions.
@@ -1906,10 +2122,32 @@ unsafe extern "system" fn panel_wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            // Re-armed on every move: it lapses each time it fires, and is
+            // what clears the hover states when the pointer leaves.
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
             let mut panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(panel) = panel_guard.as_mut() {
                 let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+                let chrome = {
+                    let mut client = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut client);
+                    chrome_hit_at(&client, GetDpiForWindow(hwnd).max(96), x, y)
+                };
+                if chrome != panel.hovered_chrome {
+                    panel.hovered_chrome = chrome;
+                    let mut client = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut client);
+                    let strip = caption_strip(&client, GetDpiForWindow(hwnd).max(96));
+                    let _ = InvalidateRect(hwnd, Some(&strip), false);
+                }
 
                 // The open picker swallows hover: everything underneath it
                 // is obscured anyway.
@@ -2208,10 +2446,11 @@ unsafe extern "system" fn panel_wnd_proc(
             let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
             let old_bmp = SelectObject(mem_dc, mem_bmp);
 
-            paint_panel_chrome_bg(mem_dc, &client);
+            paint_panel_chrome_bg(mem_dc, &client, dpi);
             {
                 let panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(panel) = panel_guard.as_ref() {
+                    paint_caption(mem_dc, &client, dpi, hwnd, &panel.view, panel.hovered_chrome);
                     let nav = panel.nav();
                     for (tile, rect) in &panel.layout_cache {
                         tile.paint(
@@ -2226,8 +2465,6 @@ unsafe extern "system" fn panel_wnd_proc(
                     }
                 }
             }
-            paint_chrome_buttons(mem_dc, &client, dpi, hwnd);
-            paint_quota_strip(mem_dc, &client, dpi);
             {
                 let panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(panel) = panel_guard.as_ref() {
@@ -2503,18 +2740,34 @@ unsafe extern "system" fn panel_wnd_proc(
 
 /// Toggle the panel between its two views. Right-clicking the same button
 /// opens the grid-size picker instead.
-fn cycle_view(hwnd: HWND) {
+fn set_chrome_hover(hwnd: HWND, hit: Option<ChromeHit>) {
     let mut panel_guard = PANEL.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(panel) = panel_guard.as_mut() {
-        let next = match panel.view {
-            PanelView::Dashboard { .. } => PanelView::Grid,
-            PanelView::Grid => PanelView::Dashboard { queue_mode: false },
-        };
-        panel.set_view(next);
-        panel.recompute_layout(hwnd);
+    let Some(panel) = panel_guard.as_mut() else {
+        return;
+    };
+    if panel.hovered_chrome == hit {
+        return;
     }
+    panel.hovered_chrome = hit;
     unsafe {
-        let _ = InvalidateRect(hwnd, None, false);
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let strip = caption_strip(&client, GetDpiForWindow(hwnd).max(96));
+        let _ = InvalidateRect(hwnd, Some(&strip), false);
+    }
+}
+
+/// Drop the caption hover, but only if it is still `hit` — a leave that
+/// arrives after the pointer has already lit another control must not
+/// switch that one off.
+fn clear_chrome_hover(hwnd: HWND, hit: ChromeHit) {
+    let current = PANEL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|p| p.hovered_chrome);
+    if current == Some(hit) {
+        set_chrome_hover(hwnd, None);
     }
 }
 
@@ -2529,12 +2782,37 @@ fn switch_view(hwnd: HWND, view: PanelView) {
     }
 }
 
-fn paint_panel_chrome_bg(hdc: HDC, client: &RECT) {
-    let claude_grey = Color::from_hex(CLAUDE_GREY_HEX);
+/// The rail over the whole client area, then the content layer on top of it:
+/// Claude grey, rounded, with a hairline edge where it meets the rail.
+fn paint_panel_chrome_bg(hdc: HDC, client: &RECT, dpi: u32) {
+    let layer = layer_rect(client, dpi);
+    let diameter = 2 * px(LAYER_RADIUS, dpi).max(2);
     unsafe {
-        let bg_brush = CreateSolidBrush(COLORREF(claude_grey.to_colorref()));
-        FillRect(hdc, client, bg_brush);
-        let _ = DeleteObject(bg_brush);
+        let rail = CreateSolidBrush(COLORREF(Color::from_hex(RAIL_HEX).to_colorref()));
+        FillRect(hdc, client, rail);
+        let _ = DeleteObject(rail);
+
+        let fill = CreateSolidBrush(COLORREF(Color::from_hex(CLAUDE_GREY_HEX).to_colorref()));
+        let pen = CreatePen(
+            PS_SOLID,
+            1,
+            COLORREF(Color::from_hex(LAYER_STROKE_HEX).to_colorref()),
+        );
+        let old_brush = SelectObject(hdc, fill);
+        let old_pen = SelectObject(hdc, pen);
+        let _ = RoundRect(
+            hdc,
+            layer.left,
+            layer.top,
+            layer.right,
+            layer.bottom,
+            diameter,
+            diameter,
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(fill);
+        let _ = DeleteObject(pen);
     }
 }
 
@@ -2559,43 +2837,24 @@ pub fn refresh_quota_strip() {
     }
 }
 
-/// The widget's two quota bars, drawn right-aligned against the chrome
-/// buttons. Two tiers: the full "42% - 2h 10m" line, and bare percentages
-/// once the panel is too narrow for it. Narrower still and the strip stays
-/// empty - half a bar reads worse than none.
-fn paint_quota_strip(hdc: HDC, client: &RECT, dpi: u32) {
+/// The widget's two quota bars, right-aligned at `right_edge` and kept clear
+/// of `min_left`. Two tiers: the full "42% - 2h 10m" line, and bare
+/// percentages once the caption is too narrow for it. Narrower still and
+/// the strip stays empty - half a bar reads worse than none.
+fn paint_quota_strip(hdc: HDC, client: &RECT, dpi: u32, min_left: i32, right_edge: i32, fg: Color) {
     let Some(rows) = window::quota_rows() else {
         return;
     };
-    let scale = dpi as f64 / 96.0;
-    let px = |v: i32| (v as f64 * scale).round() as i32;
+    let px = |v: i32| px(v, dpi);
     let strip = caption_strip(client, dpi);
     let seg_w = px(QUOTA_SEG_W).max(2);
     let seg_h = px(QUOTA_SEG_H).max(4);
     let seg_gap = px(QUOTA_SEG_GAP).max(1);
     let bar_w = QUOTA_SEG_COUNT * (seg_w + seg_gap) - seg_gap;
     let top = strip.top + ((strip.bottom - strip.top) - seg_h) / 2;
-    let right_edge = view_button_rect(client, dpi).left - px(QUOTA_BUTTON_GAP);
-    let min_left = client.left + px(PANEL_PAD_X);
 
     unsafe {
-        let face = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
-            -(QUOTA_FONT_PT * dpi as i32 / 72),
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(face.as_ptr()),
-        );
+        let font = native_interop::ui_font(dpi, QUOTA_FONT_PT, FW_NORMAL.0 as i32, UiFace::Text);
         let old_font = SelectObject(hdc, font);
         let _ = SetBkMode(hdc, TRANSPARENT);
 
@@ -2637,7 +2896,7 @@ fn paint_quota_strip(hdc: HDC, client: &RECT, dpi: u32) {
         // whatever the label and countdown widths come out to.
         let accent = Color::from_hex(ORANGE_HEX);
         let track = Color::from_hex(QUOTA_TRACK_HEX);
-        let _ = SetTextColor(hdc, COLORREF(Color::from_hex(QUOTA_FG_HEX).to_colorref()));
+        let _ = SetTextColor(hdc, COLORREF(fg.to_colorref()));
         let mut x = right_edge;
         for (row, text) in rows.iter().zip(texts).rev() {
             let tw = text_w(text);
@@ -2762,70 +3021,138 @@ fn fill_rounded(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
     }
 }
 
-fn paint_chrome_buttons(hdc: HDC, client: &RECT, dpi: u32, hwnd: HWND) {
-    let orange = Color::from_hex(ORANGE_HEX);
-    let scale = dpi as f64 / 96.0;
-    let pen_w = (CHROME_STROKE as f64 * scale).round().max(1.0) as i32;
-    let close = close_button_rect(client, dpi);
-    let maximize = maximize_button_rect(client, dpi);
-    let minimize = minimize_button_rect(client, dpi);
-    let view = view_button_rect(client, dpi);
+/// The app's own icon at `size` device pixels, picked from the embedded
+/// .ico's frames by the loader rather than scaled from one. Kept for the
+/// life of the process, one per size the panel has been drawn at.
+fn brand_icon(size: i32) -> HICON {
+    static CACHE: Mutex<Vec<(i32, isize)>> = Mutex::new(Vec::new());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, handle)) = cache.iter().find(|(s, _)| *s == size) {
+        return HICON(*handle as *mut _);
+    }
+    let icon = unsafe {
+        let module = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
+        // winres embeds the application icon as resource 1.
+        LoadImageW(
+            HINSTANCE(module.0),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            size,
+            size,
+            LR_DEFAULTCOLOR,
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default()
+    };
+    cache.push((size, icon.0 as isize));
+    icon
+}
+
+fn draw_line(hdc: HDC, text: &str, rect: RECT, color: Color, flags: DRAW_TEXT_FORMAT) {
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut rect = rect;
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        let _ = DrawTextW(hdc, &mut wide, &mut rect, flags | DT_SINGLELINE | DT_NOPREFIX);
+    }
+}
+
+/// Everything in the caption rail: app mark and name, the view tabs, the
+/// quota gauges and the caption buttons. Glyphs and text only — hover
+/// lights a control's ink, it never grows a fill.
+fn paint_caption(
+    hdc: HDC,
+    client: &RECT,
+    dpi: u32,
+    hwnd: HWND,
+    view: &PanelView,
+    hovered: Option<ChromeHit>,
+) {
+    let active = PANEL_ACTIVE.load(Ordering::Relaxed);
+    let ink = Color::from_hex(if active { INK_HEX } else { MUTED_HEX });
+    let muted = Color::from_hex(if active { MUTED_HEX } else { FAINT_HEX });
+    let accent = Color::from_hex(if active { ORANGE_HEX } else { FAINT_HEX });
+    let centered = DT_CENTER | DT_VCENTER;
 
     unsafe {
-        let pen = CreatePen(PS_SOLID, pen_w, COLORREF(orange.to_colorref()));
-        let old_pen = SelectObject(hdc, pen);
-        let null_brush = GetStockObject(NULL_BRUSH);
-        let old_brush = SelectObject(hdc, null_brush);
+        let _ = SetBkMode(hdc, TRANSPARENT);
 
-        // Close: orange "X".
-        let _ = MoveToEx(hdc, close.left, close.top, None);
-        let _ = LineTo(hdc, close.right, close.bottom);
-        let _ = MoveToEx(hdc, close.right, close.top, None);
-        let _ = LineTo(hdc, close.left, close.bottom);
+        let icon = brand_icon_rect(client, dpi);
+        let size = icon.right - icon.left;
+        let _ = DrawIconEx(
+            hdc,
+            icon.left,
+            icon.top,
+            brand_icon(size),
+            size,
+            size,
+            0,
+            HBRUSH::default(),
+            DI_NORMAL,
+        );
 
-        // Maximize / restore.
-        if IsZoomed(hwnd).as_bool() {
-            let off = pen_w.max(2);
-            let inner = RECT {
-                left: maximize.left,
-                top: maximize.top + off,
-                right: maximize.right - off,
-                bottom: maximize.bottom,
-            };
-            let outer = RECT {
-                left: maximize.left + off,
-                top: maximize.top,
-                right: maximize.right,
-                bottom: maximize.bottom - off,
-            };
-            let _ = Rectangle(hdc, inner.left, inner.top, inner.right, inner.bottom);
-            let _ = Rectangle(hdc, outer.left, outer.top, outer.right, outer.bottom);
-        } else {
-            let _ = Rectangle(
-                hdc,
-                maximize.left,
-                maximize.top,
-                maximize.right,
-                maximize.bottom,
-            );
+        let brand_font =
+            native_interop::ui_font(dpi, BRAND_FONT_PT, FW_SEMIBOLD.0 as i32, UiFace::Display);
+        let old_font = SelectObject(hdc, brand_font);
+        draw_line(hdc, APP_NAME, brand_name_rect(client, dpi), ink, DT_LEFT | DT_VCENTER);
+
+        let tab_font = native_interop::ui_font(dpi, TAB_FONT_PT, FW_NORMAL.0 as i32, UiFace::Text);
+        SelectObject(hdc, tab_font);
+        let tabs = tab_rects(client, dpi);
+        for (rect, tab) in tabs.iter().zip(ViewTab::ALL) {
+            let current = tab.shows(view);
+            let lit = current || hovered == Some(ChromeHit::Tab(tab));
+            draw_line(hdc, tab.label(), *rect, if lit { ink } else { muted }, centered);
+            if current {
+                let w = px(TAB_MARK_W, dpi);
+                let h = px(TAB_MARK_H, dpi).max(2);
+                let mid = (rect.left + rect.right) / 2;
+                let mark = RECT {
+                    left: mid - w / 2,
+                    top: rect.bottom - h,
+                    right: mid - w / 2 + w,
+                    bottom: rect.bottom,
+                };
+                fill_rounded(hdc, &mark, &accent, h / 2);
+            }
         }
 
-        // Minimize: a horizontal line near the bottom of the cell.
-        let _ = MoveToEx(hdc, minimize.left, minimize.bottom, None);
-        let _ = LineTo(hdc, minimize.right, minimize.bottom);
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(brand_font);
+        let _ = DeleteObject(tab_font);
 
-        // View cycle: a small 2x2 grid that hints at "switch layout".
-        let mid_x = (view.left + view.right) / 2;
-        let mid_y = (view.top + view.bottom) / 2;
-        let _ = MoveToEx(hdc, mid_x, view.top, None);
-        let _ = LineTo(hdc, mid_x, view.bottom);
-        let _ = MoveToEx(hdc, view.left, mid_y, None);
-        let _ = LineTo(hdc, view.right, mid_y);
-        let _ = Rectangle(hdc, view.left, view.top, view.right, view.bottom);
+        let buttons = caption_button_rects(client, dpi);
+        paint_quota_strip(
+            hdc,
+            client,
+            dpi,
+            tabs[1].right + px(BRAND_TAB_GAP, dpi),
+            buttons[2].left - px(QUOTA_BUTTON_GAP, dpi),
+            muted,
+        );
 
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-        let _ = DeleteObject(pen);
+        let glyph_font = native_interop::icon_font(px(CAPTION_GLYPH_PX, dpi));
+        let old_font = SelectObject(hdc, glyph_font);
+        let maximize_glyph = if IsZoomed(hwnd).as_bool() {
+            GLYPH_RESTORE
+        } else {
+            GLYPH_MAXIMIZE
+        };
+        let glyphs = [
+            (ChromeHit::Close, GLYPH_CLOSE),
+            (ChromeHit::Maximize, maximize_glyph),
+            (ChromeHit::Minimize, GLYPH_MINIMIZE),
+        ];
+        for (rect, (hit, glyph)) in buttons.iter().zip(glyphs) {
+            let color = match (hovered == Some(hit), hit) {
+                (true, ChromeHit::Close) => Color::from_hex(ORANGE_HEX),
+                (true, _) => ink,
+                (false, _) => muted,
+            };
+            draw_line(hdc, &glyph.to_string(), *rect, color, centered);
+        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(glyph_font);
     }
 }
 

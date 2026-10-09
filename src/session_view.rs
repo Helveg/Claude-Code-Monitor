@@ -3,7 +3,6 @@
 //! sit side by side in a host window — each maintains its own bounds and
 //! routes input to its inner terminal.
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 
@@ -314,23 +313,11 @@ impl SessionView {
         if self.name.is_empty() {
             return;
         }
-        let label_height = -(LABEL_FONT_POINT_SIZE * dpi as i32 / 72);
-        let face = native_interop::wide_str("Segoe UI");
-        let label_font = CreateFontW(
-            label_height,
-            0,
-            0,
-            0,
+        let label_font = native_interop::ui_font(
+            dpi,
+            LABEL_FONT_POINT_SIZE,
             FW_MEDIUM.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(face.as_ptr()),
+            native_interop::UiFace::Text,
         );
         let old_label_font = SelectObject(hdc, label_font);
 

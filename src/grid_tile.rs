@@ -75,8 +75,9 @@ const CELL_BORDER_HEX: &str = "#3A3A38";
 const STATUS_IDLE_HEX: &str = "#5A5F58";
 const STATUS_THINKING_HEX: &str = "#5BD16B";
 const STATUS_NEEDS_HEX: &str = "#E07A5F";
-const SCROLLBAR_TRACK_HEX: &str = "#1B1B19";
-const SCROLLBAR_THUMB_HEX: &str = "#3A3A38";
+const SCROLLBAR_THUMB_HEX: &str = "#4A4944";
+/// Drawn width of the thumb inside the `SCROLLBAR_W` gutter.
+const SCROLLBAR_THUMB_W: i32 = 4;
 
 /// Dot colour for a session's status, drawn in the terminal's name label.
 pub fn status_color(status: SessionStatus) -> Color {
@@ -605,15 +606,19 @@ fn paint_scrollbar(hdc: HDC, bounds: &RECT, plan: &GridPlan, dpi: u32, scroll_y:
     let Some((track, thumb)) = scrollbar_rects(bounds, plan, dpi, scroll_y) else {
         return;
     };
-    let track_color = Color::from_hex(SCROLLBAR_TRACK_HEX);
+    // Only the thumb is drawn, as a slim pill centred in the gutter. The
+    // whole gutter still takes the clicks and drags.
+    let _ = track;
+    let scale = dpi as f64 / 96.0;
+    let w = (SCROLLBAR_THUMB_W as f64 * scale).round().max(2.0) as i32;
+    let left = (thumb.left + thumb.right - w) / 2;
     let thumb_color = Color::from_hex(SCROLLBAR_THUMB_HEX);
     unsafe {
-        let track_brush = CreateSolidBrush(COLORREF(track_color.to_colorref()));
-        FillRect(hdc, &track, track_brush);
-        let _ = DeleteObject(track_brush);
-        let thumb_brush = CreateSolidBrush(COLORREF(thumb_color.to_colorref()));
-        FillRect(hdc, &thumb, thumb_brush);
-        let _ = DeleteObject(thumb_brush);
+        let brush = CreateSolidBrush(COLORREF(thumb_color.to_colorref()));
+        let rgn = CreateRoundRectRgn(left, thumb.top, left + w + 1, thumb.bottom + 1, w, w);
+        let _ = FillRgn(hdc, rgn, brush);
+        let _ = DeleteObject(rgn);
+        let _ = DeleteObject(brush);
     }
 }
 

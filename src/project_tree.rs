@@ -33,7 +33,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 
 use crate::dashboard::{CursorHint, NavSearch, NavState, TileAction};
-use crate::native_interop::{self, Color};
+use crate::native_interop::{self, Color, UiFace};
 use crate::projects::{AttentionRow, ProjectNode};
 use crate::sessions::{SessionId, SessionStatus, Sessions};
 
@@ -86,8 +86,13 @@ const PROJECT_FONT_PT: i32 = 10;
 const SESSION_FONT_PT: i32 = 9;
 const COUNT_FONT_PT: i32 = 8;
 
-const ROW_BG_HOVER_HEX: &str = "#2E2E2C";
-const ROW_BG_FOCUSED_HEX: &str = "#3A3A38";
+const ROW_BG_HOVER_HEX: &str = "#2F2F2C";
+const ROW_BG_FOCUSED_HEX: &str = "#363632";
+/// Row washes stop short of the tile's edges and round their corners.
+const ROW_WASH_INSET: i32 = 4;
+const ROW_WASH_RADIUS: i32 = 5;
+const SELECTED_PILL_W: i32 = 3;
+const HEADER_FONT_PT: i32 = 10;
 const PROJECT_FG_HEX: &str = "#E8E8E8";
 const SESSION_FG_HEX: &str = "#C8C4BE";
 const HISTORY_FG_HEX: &str = "#8B857E";
@@ -610,25 +615,12 @@ fn status_color(status: SessionStatus) -> Color {
 }
 
 fn make_font(dpi: u32, point_size: i32, weight: i32) -> HFONT {
-    let face = native_interop::wide_str("Segoe UI");
-    unsafe {
-        CreateFontW(
-            -(point_size * dpi as i32 / 72),
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(face.as_ptr()),
-        )
-    }
+    let face = if point_size <= 8 {
+        UiFace::Small
+    } else {
+        UiFace::Text
+    };
+    native_interop::ui_font(dpi, point_size, weight, face)
 }
 
 fn draw_text(hdc: HDC, text: &str, rect: RECT, color: Color, flags: DRAW_TEXT_FORMAT) {
@@ -640,6 +632,44 @@ fn draw_text(hdc: HDC, text: &str, rect: RECT, color: Color, flags: DRAW_TEXT_FO
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
         let _ = DrawTextW(hdc, &mut wide, &mut rect, flags);
+    }
+}
+
+/// A row's hover wash: rounded, and pulled in from the tile's edges so it
+/// reads as a highlight on the row rather than a band across the list.
+fn wash(hdc: HDC, rect: &RECT, color: Color, dpi: u32) {
+    let inset = scaled(ROW_WASH_INSET, dpi);
+    let radius = scaled(ROW_WASH_RADIUS, dpi).max(2);
+    let r = RECT {
+        left: rect.left + inset,
+        top: rect.top + scaled(1, dpi),
+        right: rect.right - inset,
+        bottom: rect.bottom - scaled(1, dpi),
+    };
+    unsafe {
+        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+        let rgn = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius * 2, radius * 2);
+        let _ = FillRgn(hdc, rgn, brush);
+        let _ = DeleteObject(rgn);
+        let _ = DeleteObject(brush);
+    }
+}
+
+/// The focused session's row: the wash in its selected shade, and a short
+/// orange pill on its leading edge — the marker Windows puts on the selected
+/// item of a navigation list.
+fn paint_selected(hdc: HDC, rect: &RECT, dpi: u32) {
+    wash(hdc, rect, Color::from_hex(ROW_BG_FOCUSED_HEX), dpi);
+    let w = scaled(SELECTED_PILL_W, dpi).max(2);
+    let h = ((rect.bottom - rect.top) as f64 * 0.42).round() as i32;
+    let left = rect.left + scaled(ROW_WASH_INSET, dpi);
+    let top = (rect.top + rect.bottom - h) / 2;
+    unsafe {
+        let brush = CreateSolidBrush(COLORREF(Color::from_hex(ORANGE_HEX).to_colorref()));
+        let rgn = CreateRoundRectRgn(left, top, left + w + 1, top + h + 1, w, w);
+        let _ = FillRgn(hdc, rgn, brush);
+        let _ = DeleteObject(rgn);
+        let _ = DeleteObject(brush);
     }
 }
 
@@ -676,12 +706,14 @@ pub fn paint(
     let pad_x = scaled(PAD_X, dpi);
     let text_flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
 
+    let header_font =
+        native_interop::ui_font(dpi, HEADER_FONT_PT, FW_SEMIBOLD.0 as i32, UiFace::Display);
     paint_header(
         hdc,
         &bounds,
         dpi,
         nav,
-        project_font,
+        header_font,
         session_font,
         count_font,
     );
@@ -731,9 +763,9 @@ pub fn paint(
             RowKind::Attention { id, label, reason } => {
                 let hovered = nav.hovered == Some(NavTarget::Attention(id));
                 if focused == Some(id) {
-                    fill(hdc, &rect, Color::from_hex(ROW_BG_FOCUSED_HEX));
+                    paint_selected(hdc, &rect, dpi);
                 } else if hovered {
-                    fill(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX));
+                    wash(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX), dpi);
                 }
                 let dot_x = rect.left + pad_x + scaled(CHILD_INDENT, dpi);
                 paint_dot(
@@ -787,7 +819,7 @@ pub fn paint(
             } => {
                 let row_hovered = nav.hovered == Some(NavTarget::Project(index));
                 if row_hovered {
-                    fill(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX));
+                    wash(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX), dpi);
                 }
                 // The `×` only shows while the cursor is somewhere on the
                 // row, so a resting nav isn't a column of delete buttons.
@@ -869,9 +901,9 @@ pub fn paint(
             } => {
                 let hovered = nav.hovered == Some(NavTarget::Live(id));
                 if focused == Some(id) {
-                    fill(hdc, &rect, Color::from_hex(ROW_BG_FOCUSED_HEX));
+                    paint_selected(hdc, &rect, dpi);
                 } else if hovered {
-                    fill(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX));
+                    wash(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX), dpi);
                 }
                 let dot_x = rect.left + pad_x + scaled(CHILD_INDENT, dpi);
                 let (dot_color, fg) = if dormant {
@@ -897,7 +929,7 @@ pub fn paint(
             } => {
                 let hovered = nav.hovered == Some(NavTarget::History(project, index));
                 if hovered {
-                    fill(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX));
+                    wash(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX), dpi);
                 }
                 let dot_x = rect.left + pad_x + scaled(CHILD_INDENT, dpi);
                 paint_dot(hdc, dot_x, rect, Color::from_hex(META_FG_HEX), false, dpi);
@@ -920,7 +952,7 @@ pub fn paint(
             RowKind::ShowMore { project, expanded } => {
                 let hovered = nav.hovered == Some(NavTarget::ShowMore(project));
                 if hovered {
-                    fill(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX));
+                    wash(hdc, &rect, Color::from_hex(ROW_BG_HOVER_HEX), dpi);
                 }
                 // No dot: this row isn't a conversation. Its label starts
                 // where the conversation titles above it do, so the column
@@ -978,6 +1010,7 @@ pub fn paint(
         let _ = DeleteObject(project_font);
         let _ = DeleteObject(session_font);
         let _ = DeleteObject(count_font);
+        let _ = DeleteObject(header_font);
     }
 }
 
