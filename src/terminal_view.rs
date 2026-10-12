@@ -856,9 +856,15 @@ impl TerminalView {
         self.scroll_view_by(target as i32 - offset as i32)
     }
 
+    /// `None` when there is no area to size from: a minimized panel lays out
+    /// into a 0×0 client rect, and clamping that up to the 20×5 floor would
+    /// have every session wrap its output to a sliver until it's restored.
     fn term_dimensions(&self, dpi: u32) -> Option<(u16, u16)> {
         unsafe {
             let area = self.term_area(dpi);
+            if area.right <= area.left || area.bottom <= area.top {
+                return None;
+            }
             let font = create_term_font(dpi, self.font_pt);
             if font.is_invalid() {
                 return None;
@@ -2001,5 +2007,21 @@ mod tests {
         // shifted by 32. TUIs predating SGR rely on this exact framing.
         let bytes = encode_mouse_event(0, 5, 7, MouseEncoding::Legacy);
         assert_eq!(bytes, &[0x1b, b'[', b'M', 32, 37, 39]);
+    }
+
+    /// A minimized panel lays out into a 0×0 client rect, which leaves the
+    /// view a rect turned inside out by its insets.
+    #[test]
+    fn an_empty_rect_neither_spawns_nor_sizes_the_terminal() {
+        let mut view = TerminalView::new(HWND::default(), 0, "cmd", None);
+        let minimized = RECT {
+            left: 14,
+            top: 14,
+            right: -14,
+            bottom: -14,
+        };
+        view.set_bounds(minimized, 96, FONT_POINT_SIZE);
+        assert!(view.terminal.is_none());
+        assert!(view.term_dimensions(96).is_none());
     }
 }

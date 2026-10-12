@@ -230,6 +230,10 @@ pub struct Grid {
     /// trimmed, so ids held by scrollback lines stay valid; a TUI repainting
     /// the same links re-uses their entries.
     links: Vec<String>,
+    /// Open while the repaint that follows a resize is still landing: the
+    /// absolute index (see [`viewport_origin`](Grid::viewport_origin)) of
+    /// the first history line [`settle_resize`](Grid::settle_resize) may cut.
+    resize_settle_from: Option<u64>,
 }
 
 /// Scrollback line cap. ~5k lines of an 80-wide grid is a few MB per
@@ -279,6 +283,7 @@ impl Grid {
             trimmed_lines: 0,
             is_alt: false,
             links: Vec::new(),
+            resize_settle_from: None,
         }
     }
 
@@ -301,6 +306,7 @@ impl Grid {
     /// Shift the viewport by `delta` lines (positive = back in history).
     /// Returns true when the offset actually moved.
     pub fn scroll_view(&mut self, delta: i32) -> bool {
+        self.settle_resize();
         let target = self.view_offset as i64 + delta as i64;
         let clamped = target.clamp(0, self.scrollback.len() as i64) as usize;
         if clamped == self.view_offset {
@@ -377,6 +383,13 @@ impl Grid {
     /// back, the offset grows with the history so the viewport stays put on
     /// the same text instead of drifting as output arrives.
     fn push_scrollback(&mut self, n: usize) {
+        // New output scrolling off means the post-resize repaint is done.
+        self.settle_resize();
+        self.push_rows(n);
+    }
+
+    /// Copy screen rows `0..n` to the end of scrollback.
+    fn push_rows(&mut self, n: usize) {
         let cols = self.cols as usize;
         for row in 0..n {
             let start = row * cols;
@@ -738,12 +751,36 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        // ConPTY answers a resize by repainting the new screen top-down,
+        // without scrolling, wherever conhost re-anchored its viewport — and
+        // claude follows with a reprint of its transcript tail. So a shrink
+        // shows the bottom of the old screen, a grow pulls history back into
+        // view, and a width change rewraps; rows that leave the screen this
+        // way never reach us as scrolled-off output. The old screen goes to
+        // history up front, and `settle_resize` trims what the repaint shows
+        // again once it has landed.
+        let mut shift = 0;
+        if !self.is_alt {
+            self.settle_resize();
+            let text_rows = self.text_rows();
+            if text_rows > 0 {
+                let start = self.trimmed_lines + self.scrollback.len() as u64;
+                self.push_rows(text_rows);
+                self.resize_settle_from =
+                    Some(start.saturating_sub(rows as u64).max(self.trimmed_lines));
+            }
+            // Until the repaint lands, keep showing the bottom of the old
+            // screen, cursor included.
+            shift = text_rows
+                .max(self.cursor_row as usize + 1)
+                .saturating_sub(rows as usize);
+        }
         let mut new_cells = vec![Cell::default(); cols as usize * rows as usize];
-        let copy_rows = self.rows.min(rows) as usize;
+        let copy_rows = (self.rows as usize - shift).min(rows as usize);
         let copy_cols = self.cols.min(cols) as usize;
         for r in 0..copy_rows {
             for c in 0..copy_cols {
-                let old = self.cells[r * self.cols as usize + c];
+                let old = self.cells[(r + shift) * self.cols as usize + c];
                 new_cells[r * cols as usize + c] = old;
             }
         }
@@ -752,12 +789,98 @@ impl Grid {
         self.rows = rows;
         self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
-        self.cursor_row = self.cursor_row.min(rows - 1);
+        self.cursor_row = (self.cursor_row as usize)
+            .saturating_sub(shift)
+            .min(rows as usize - 1) as u16;
         self.cursor_col = self.cursor_col.min(cols - 1);
+        self.last_cursor_glyph_cell = None;
         // A shorter screen can't show more history than exists, and the
         // scrollback lines keep their old width — `display_cell` pads them.
         self.view_offset = self.view_offset.min(self.scrollback.len());
     }
+
+    /// Rows from the top down to the last one holding text; 0 when blank.
+    fn text_rows(&self) -> usize {
+        let cols = self.cols as usize;
+        (0..self.rows as usize)
+            .rev()
+            .find(|&r| !line_text(&self.cells[r * cols..(r + 1) * cols]).is_empty())
+            .map_or(0, |r| r + 1)
+    }
+
+    /// Close the window `resize` opened: cut the tail of history that the
+    /// repaint has put back on screen. The two are lined up by row text —
+    /// the first screen row that matches a history line and carries on
+    /// matching marks where the old content continues on screen. Rows above
+    /// that anchor are lines claude rewrapped to the new width; their
+    /// old-width copies stay in history. Without an anchor (the screen was
+    /// cleared or replaced) nothing is cut: a duplicate beats a lost line.
+    fn settle_resize(&mut self) {
+        let Some(from) = self.resize_settle_from.take() else {
+            return;
+        };
+        let len = self.scrollback.len();
+        let from = (from.max(self.trimmed_lines) - self.trimmed_lines) as usize;
+        if from >= len {
+            return;
+        }
+        let history: Vec<String> = self
+            .scrollback
+            .range(from..)
+            .map(|l| line_text(l))
+            .collect();
+        let cols = self.cols as usize;
+        let screen: Vec<String> = self.cells.chunks(cols).map(line_text).collect();
+        let Some(cut) = repainted_tail(&history, &screen) else {
+            return;
+        };
+        let cut = from + cut;
+        self.scrollback.truncate(cut);
+        // A reader scrolled back stays on the same lines.
+        self.view_offset = self
+            .view_offset
+            .saturating_sub(len - cut)
+            .min(self.scrollback.len());
+    }
+}
+
+/// Text of one row, trailing blanks dropped.
+fn line_text(cells: &[Cell]) -> String {
+    let s: String = cells.iter().map(|c| c.ch).collect();
+    s.trim_end().to_string()
+}
+
+/// Where `history`'s tail starts repeating on `screen`, as an index into
+/// `history`: the earliest screen row with a match, at the history line
+/// whose run of matches is longest. A run counts once it is
+/// `ANCHOR_RUN` rows long or runs to the end of history — shorter runs are
+/// too likely to be a divider or a stock line that merely recurs.
+fn repainted_tail(history: &[String], screen: &[String]) -> Option<usize> {
+    const ANCHOR_RUN: usize = 3;
+    for (row, text) in screen.iter().enumerate() {
+        if text.is_empty() {
+            continue;
+        }
+        let mut best: Option<(usize, usize)> = None;
+        for k in (0..history.len()).rev() {
+            if history[k] != *text {
+                continue;
+            }
+            let run = history[k..]
+                .iter()
+                .zip(&screen[row..])
+                .take_while(|(h, s)| h == s)
+                .count();
+            let anchored = run >= ANCHOR_RUN || k + run == history.len();
+            if anchored && best.is_none_or(|(_, b)| run > b) {
+                best = Some((k, run));
+            }
+        }
+        if let Some((k, _)) = best {
+            return Some(k);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,6 +1306,9 @@ impl Parser {
                         let preserved_enc = grid.mouse_encoding;
                         let preserved_bp = grid.bracketed_paste;
                         if let Some(mut saved) = self.alt_grid.take() {
+                            // Resizes while the alt screen is up never
+                            // reached the saved primary.
+                            saved.resize(grid.cols, grid.rows);
                             saved.mouse_protocol = preserved_proto;
                             saved.mouse_encoding = preserved_enc;
                             saved.bracketed_paste = preserved_bp;
@@ -2068,5 +2194,104 @@ mod tests {
         feed(&mut p, &mut g, b"\r\n\x1b[1;2;3;4;9mz\x1b[0mw");
         assert!(g.cell(3, 0).attrs.styled());
         assert!(!g.cell(3, 1).attrs.styled());
+    }
+
+    /// Every line the buffer holds, scrollback first, with the live
+    /// screen's trailing blank rows dropped.
+    fn all_lines(g: &Grid) -> Vec<String> {
+        let mut out: Vec<String> = g.scrollback.iter().map(|l| line_text(l)).collect();
+        let mut screen: Vec<String> = (0..g.rows).map(|r| row_text(g, r)).collect();
+        while screen.last().is_some_and(|l| l.is_empty()) {
+            screen.pop();
+        }
+        out.extend(screen);
+        out
+    }
+
+    fn lines(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn shrink_keeps_the_rows_the_repaint_moves_off_screen() {
+        // ConPTY answers a shrink by repainting the bottom of the old screen
+        // from the top row, without scrolling; L3 and L4 never scroll off.
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 5);
+        feed(&mut p, &mut g, b"L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7");
+        g.resize(10, 3);
+        feed(&mut p, &mut g, b"\x1b[HL5\x1b[K\r\nL6\x1b[K\r\nL7\x1b[K\r\nL8");
+        assert_eq!(all_lines(&g), lines(&["L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8"]));
+    }
+
+    #[test]
+    fn grow_drops_history_the_repaint_pulls_back_on_screen() {
+        // claude reprints its transcript after a resize, so a taller screen
+        // shows lines that had already scrolled off.
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 3);
+        feed(&mut p, &mut g, b"L1\r\nL2\r\nL3\r\nL4\r\nL5");
+        g.resize(10, 5);
+        feed(&mut p, &mut g, b"\x1b[HL1\r\nL2\r\nL3\r\nL4\r\nL5");
+        g.scroll_view(0);
+        assert_eq!(g.scrollback_len(), 0);
+        assert_eq!(all_lines(&g), lines(&["L1", "L2", "L3", "L4", "L5"]));
+    }
+
+    #[test]
+    fn narrowing_keeps_history_above_a_rewrapped_line() {
+        // The reprint rewraps "one two three" at the new width; rows from
+        // the first one that still matches history down are the repaint.
+        let mut p = Parser::new();
+        let mut g = Grid::new(14, 4);
+        feed(&mut p, &mut g, b"head\r\nintro\r\none two three\r\ntail1\r\ntail2");
+        g.resize(8, 4);
+        feed(&mut p, &mut g, b"\x1b[Hone two\x1b[K\r\nthree\x1b[K\r\ntail1\x1b[K\r\ntail2\x1b[K");
+        g.scroll_view(0);
+        assert_eq!(
+            all_lines(&g),
+            lines(&["head", "intro", "one two three", "one two", "three", "tail1", "tail2"])
+        );
+    }
+
+    #[test]
+    fn a_repaint_with_nothing_in_common_cuts_no_history() {
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 3);
+        feed(&mut p, &mut g, b"L1\r\nL2\r\nL3");
+        g.resize(10, 2);
+        feed(&mut p, &mut g, b"\x1b[Hnew\x1b[K\r\nscreen\x1b[K");
+        g.scroll_view(0);
+        assert_eq!(all_lines(&g), lines(&["L1", "L2", "L3", "new", "screen"]));
+    }
+
+    #[test]
+    fn resizing_a_blank_screen_adds_no_history() {
+        let mut g = Grid::new(10, 3);
+        g.resize(12, 2);
+        g.resize(14, 5);
+        assert_eq!(g.scrollback_len(), 0);
+    }
+
+    #[test]
+    fn leaving_the_alt_screen_restores_the_primary_at_the_current_size() {
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 3);
+        feed(&mut p, &mut g, b"\x1b[?1049h");
+        g.resize(16, 6);
+        feed(&mut p, &mut g, b"\x1b[?1049l");
+        assert_eq!((g.cols, g.rows), (16, 6));
+        assert_eq!(g.cells.len(), 16 * 6);
+    }
+
+    #[test]
+    fn shrinking_below_text_under_the_cursor_keeps_the_cursor_on_screen() {
+        // claude parks the cursor in its input box with the status line
+        // below it; the shrink can be larger than the cursor's row.
+        let mut p = Parser::new();
+        let mut g = Grid::new(10, 6);
+        feed(&mut p, &mut g, b"[6;1Hstatus[2;1H");
+        g.resize(10, 2);
+        assert!(g.cursor_row < g.rows);
     }
 }
